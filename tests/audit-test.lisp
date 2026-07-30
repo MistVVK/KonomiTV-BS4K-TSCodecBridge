@@ -358,6 +358,20 @@
          packet))))))
 
 (define-bridge-test psi-reserved-bits-fail-with-valid-crc
+  (check-bridge-test
+   (signals-bridge-error-p
+    (lambda ()
+      (parse-pat-section
+       (make-array 11
+                   :element-type 'octet
+                   :initial-element 0)))))
+  (check-bridge-test
+   (signals-bridge-error-p
+    (lambda ()
+      (parse-pmt-section
+       (make-array 15
+                   :element-type 'octet
+                   :initial-element 0)))))
   (let ((pat
           (build-pat-section
            (make-program-association-table
@@ -384,6 +398,130 @@
     (check-bridge-test
      (signals-bridge-error-p
       (lambda () (parse-pat-section pat)))))
+  (let ((pat
+          (build-pat-section
+           (make-program-association-table
+            :transport-stream-id 1
+            :programs
+            (list
+             (make-pat-program
+              :program-number 1 :pid +test-pmt-pid+))))))
+    (setf (aref pat 10) #xff
+          (aref pat 11) #xff)
+    (rewrite-psi-crc pat)
+    (check-bridge-test
+     (bridge-error-message-contains-p
+      (lambda () (parse-pat-section pat))
+      "PAT program PID is not assignable")))
+  (check-bridge-test
+   (bridge-error-message-contains-p
+    (lambda ()
+      (build-pat-section
+       (make-program-association-table
+        :transport-stream-id 1
+        :programs
+        (list
+         (make-pat-program
+          :program-number 1 :pid +ts-null-pid+)))))
+    "PAT program PID is not assignable"))
+  (let ((pat
+          (build-pat-section
+           (make-program-association-table
+            :transport-stream-id 1
+            :programs
+            (list
+             (make-pat-program
+              :program-number 1 :pid +test-pmt-pid+))))))
+    (setf (aref pat 10) #xe0
+          (aref pat 11) #x0f)
+    (rewrite-psi-crc pat)
+    (check-bridge-test
+     (bridge-error-message-contains-p
+      (lambda () (parse-pat-section pat))
+      "PAT program PID is not assignable")))
+  (check-bridge-test
+   (bridge-error-message-contains-p
+    (lambda ()
+      (build-pat-section
+       (make-program-association-table
+        :transport-stream-id 1
+        :programs
+        (list
+         (make-pat-program
+          :program-number 1 :pid #x0f)))))
+    "PAT program PID is not assignable"))
+  (let ((pat
+          (build-pat-section
+           (make-program-association-table
+            :transport-stream-id 1
+            :programs
+            (list
+             (make-pat-program
+              :program-number 1 :pid +test-pmt-pid+)
+             (make-pat-program
+              :program-number 2 :pid (+ +test-pmt-pid+ 1)))))))
+    (write-u16-be 1 pat 12)
+    (rewrite-psi-crc pat)
+    (check-bridge-test
+     (bridge-error-message-contains-p
+      (lambda () (parse-pat-section pat))
+      "PAT program number is duplicated")))
+  (check-bridge-test
+   (bridge-error-message-contains-p
+    (lambda ()
+      (build-pat-section
+       (make-program-association-table
+        :transport-stream-id 1
+        :programs
+        (list
+         (make-pat-program
+          :program-number 1 :pid +test-pmt-pid+)
+         (make-pat-program
+          :program-number 1 :pid (+ +test-pmt-pid+ 1))))))
+    "PAT program number is duplicated"))
+  (let ((pmt
+          (build-pmt-section
+           (make-test-pmt-table :two-audio-p nil))))
+    (write-u16-be 0 pmt 3)
+    (rewrite-psi-crc pmt)
+    (check-bridge-test
+     (bridge-error-message-contains-p
+      (lambda () (parse-pmt-section pmt))
+      "PMT program number must be non-zero")))
+  (let ((table (make-test-pmt-table :two-audio-p nil)))
+    (setf (program-map-table-program-number table) 0)
+    (check-bridge-test
+     (bridge-error-message-contains-p
+      (lambda () (build-pmt-section table))
+      "PMT program number must be non-zero")))
+  (dolist (entry
+           '((6 1 "PMT section number must be zero")
+             (7 1 "PMT last section number must be zero")))
+    (destructuring-bind (offset value marker) entry
+      (let ((pmt
+              (build-pmt-section
+               (make-test-pmt-table :two-audio-p nil))))
+        (setf (aref pmt offset) value)
+        (rewrite-psi-crc pmt)
+        (check-bridge-test
+         (bridge-error-message-contains-p
+          (lambda () (parse-pmt-section pmt))
+          marker)))))
+  (dolist (entry
+           '((section-number 1 "PMT section number must be zero")
+             (last-section-number 1
+              "PMT last section number must be zero")))
+    (destructuring-bind (field value marker) entry
+      (let ((table (make-test-pmt-table :two-audio-p nil)))
+        (ecase field
+          (section-number
+           (setf (program-map-table-section-number table) value))
+          (last-section-number
+           (setf (program-map-table-last-section-number table) value)))
+        (check-bridge-test
+         (bridge-error-message-contains-p
+          (lambda () (build-pmt-section table))
+          marker)))))
   (dolist (offset '(8 10 13 15))
     (let ((pmt
             (build-pmt-section
@@ -393,7 +531,101 @@
       (check-bridge-test
        (signals-bridge-error-p
         (lambda () (parse-pmt-section pmt)))
-       (format nil "PMT reserved field offset ~D" offset)))))
+       (format nil "PMT reserved field offset ~D" offset))))
+  (let ((pmt
+          (build-pmt-section
+           (make-test-pmt-table :two-audio-p nil))))
+    (setf (aref pmt 13) #xff
+          (aref pmt 14) #xff)
+    (rewrite-psi-crc pmt)
+    (check-bridge-test
+     (bridge-error-message-contains-p
+      (lambda () (parse-pmt-section pmt))
+      "PMT elementary PID is not assignable")))
+  (let* ((table (make-test-pmt-table :two-audio-p nil))
+         (stream (first (program-map-table-streams table))))
+    (setf (pmt-stream-elementary-pid stream) +ts-null-pid+)
+    (check-bridge-test
+     (bridge-error-message-contains-p
+      (lambda () (build-pmt-section table))
+      "PMT elementary PID is not assignable")))
+  (let ((pmt
+          (build-pmt-section
+           (make-test-pmt-table :two-audio-p nil))))
+    (setf (aref pmt 13) #xe0
+          (aref pmt 14) #x0f)
+    (rewrite-psi-crc pmt)
+    (check-bridge-test
+     (bridge-error-message-contains-p
+      (lambda () (parse-pmt-section pmt))
+      "PMT elementary PID is not assignable")))
+  (let* ((table (make-test-pmt-table :two-audio-p nil))
+         (stream (first (program-map-table-streams table))))
+    (setf (pmt-stream-elementary-pid stream) #x0f)
+    (check-bridge-test
+     (bridge-error-message-contains-p
+      (lambda () (build-pmt-section table))
+      "PMT elementary PID is not assignable")))
+  (let ((pmt
+          (build-pmt-section
+           (make-test-pmt-table :two-audio-p nil))))
+    (setf (aref pmt 8) #xe0
+          (aref pmt 9) #x0f)
+    (rewrite-psi-crc pmt)
+    (check-bridge-test
+     (bridge-error-message-contains-p
+      (lambda () (parse-pmt-section pmt))
+      "PMT PCR PID is reserved")))
+  (let ((table (make-test-pmt-table :two-audio-p nil)))
+    (setf (program-map-table-pcr-pid table) #x0f)
+    (check-bridge-test
+     (bridge-error-message-contains-p
+      (lambda () (build-pmt-section table))
+      "PMT PCR PID is reserved")))
+  (dolist (pcr-pid '(0 1 #x10 #x1ffe #x1fff))
+    (let ((table (make-test-pmt-table :two-audio-p nil))
+          (section nil))
+      (setf (program-map-table-pcr-pid table) pcr-pid
+            section (build-pmt-section table))
+      (check-bridge-test
+       (= (program-map-table-pcr-pid
+           (parse-pmt-section section))
+          pcr-pid))))
+  (let ((table (make-test-pmt-table :two-audio-p nil)))
+    (setf (program-map-table-pcr-pid table) 2)
+    (check-bridge-test
+     (bridge-error-message-contains-p
+      (lambda () (build-pmt-section table))
+      "PMT PCR PID is reserved")))
+  (let* ((pmt
+           (build-pmt-section
+            (make-test-pmt-table :two-audio-p nil)))
+         (program-info-length
+           (logior (ash (logand (aref pmt 10) #x0f) 8)
+                   (aref pmt 11)))
+         (first-offset (+ 12 program-info-length))
+         (first-info-length
+           (logior
+            (ash (logand (aref pmt (+ first-offset 3)) #x0f) 8)
+            (aref pmt (+ first-offset 4))))
+         (second-offset (+ first-offset 5 first-info-length)))
+    (setf (aref pmt (+ second-offset 1))
+          (aref pmt (+ first-offset 1))
+          (aref pmt (+ second-offset 2))
+          (aref pmt (+ first-offset 2)))
+    (rewrite-psi-crc pmt)
+    (check-bridge-test
+     (bridge-error-message-contains-p
+      (lambda () (parse-pmt-section pmt))
+      "PMT elementary PID is duplicated")))
+  (let* ((table (make-test-pmt-table :two-audio-p nil))
+         (streams (program-map-table-streams table)))
+    (setf (pmt-stream-elementary-pid (second streams))
+          (pmt-stream-elementary-pid (first streams)))
+    (check-bridge-test
+     (bridge-error-message-contains-p
+      (lambda () (build-pmt-section table))
+      "PMT elementary PID is duplicated"))))
 
 (define-bridge-test video-input-mapping-classification-is-unambiguous
   (let ((bare (make-audit-video-stream))
@@ -520,35 +752,38 @@
 
 (define-bridge-test pusi-discontinuity-rebases-new-pes
   (let ((first-pes
-          (make-test-opus-pes 90000 (octets #xf8)))
+          (make-pes
+           #xbd (make-vp9-structure-test-key-frame) 90000))
         (second-pes
-          (make-test-opus-pes 180000 (octets #xf8)))
+          (make-pes
+           #xbd (make-vp9-structure-test-key-frame) 180000))
         (third-pes
-          (make-test-opus-pes 181800 (octets #xf8))))
-    ;; 長さ0の旧PESは次のPUSIまでactiveであり続ける。
+          (make-pes
+           #xbd (make-vp9-structure-test-key-frame) 181800)))
+    ;; 長さ0を許す映像PESは次のPUSIまでactiveであり続ける。
     (write-u16-be 0 first-pes 4)
     (let ((first
             (first
              (packetize-payload
-              +test-audio-one-pid+ first-pes
+              +test-video-pid+ first-pes
               :continuity-counter 5
               :payload-unit-start t)))
           ;; discontinuity packetは旧packetと同一CCでも新baselineになる。
           (second
             (first
              (packetize-payload
-              +test-audio-one-pid+ second-pes
+              +test-video-pid+ second-pes
               :continuity-counter 5
               :payload-unit-start t)))
           (third
             (first
              (packetize-payload
-              +test-audio-one-pid+ third-pes
+              +test-video-pid+ third-pes
               :continuity-counter 6
               :payload-unit-start t))))
       (setf (aref second 5)
             (logior (aref second 5) #x80))
-      (let ((output
+      (let* ((output
               (run-packet-processor
                (append
                 (make-test-pat-packets)
@@ -558,11 +793,18 @@
                  first
                  (make-test-program-pcr-packet
                   180000 :counter 0 :discontinuity t)
-                 second third))
-               :passthrough :opus)))
-        (dolist (packet (list first second third))
-          (check-bridge-test
-           (find packet output :test #'equalp)))))))
+                 second
+                 (make-test-program-pcr-packet
+                  180000 :counter 5)
+                 third))
+               :vp9 :aac))
+             (video-output
+               (remove-if-not
+                (lambda (packet)
+                  (= (ts-pid packet) +test-video-pid+))
+                output)))
+        (check-bridge-test
+         (= (count-if #'ts-payload-unit-start-p video-output) 3))))))
 
 (define-bridge-test continuation-discontinuity-rebases-next-pes
   (let* ((initial

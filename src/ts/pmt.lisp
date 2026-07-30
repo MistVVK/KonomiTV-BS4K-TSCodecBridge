@@ -70,17 +70,33 @@
 
 (defun parse-pmt-section (section)
   "PMT SECTIONをPROGRAM-MAP-TABLEへ変換する。"
+  (ensure-octet-range section 0 16 :parse-pmt-section)
   (validate-long-psi-section section #x02)
+  (when (zerop (read-u16-be section 3))
+    (bridge-error "PMT program number must be non-zero"))
+  (unless (zerop (aref section 6))
+    (bridge-error "PMT section number must be zero: ~D"
+                  (aref section 6)))
+  (unless (zerop (aref section 7))
+    (bridge-error "PMT last section number must be zero: ~D"
+                  (aref section 7)))
   (unless (= (logand (aref section 8) #xe0) #xe0)
     (bridge-error "PMT PCR PID reserved bits are invalid"))
   (unless (= (logand (aref section 10) #xf0) #xf0)
     (bridge-error "PMT program info length reserved bits are invalid"))
-  (let* ((streams-end (- (length section) 4))
+  (let* ((pcr-pid
+           (logior
+            (ash (logand (aref section 8) #x1f) 8)
+            (aref section 9)))
+         (streams-end (- (length section) 4))
          (program-info-length
            (logior (ash (logand (aref section 10) #x0f) 8)
                    (aref section 11)))
          (program-info-end (+ 12 program-info-length))
-         (streams '()))
+         (streams '())
+         (seen-elementary-pids (make-hash-table :test #'eql)))
+    (unless (ts-pcr-pid-p pcr-pid)
+      (bridge-error "PMT PCR PID is reserved: 0x~4,'0X" pcr-pid))
     (when (> program-info-end streams-end)
       (bridge-error "PMT program descriptor loop is truncated"))
     (let ((offset program-info-end))
@@ -108,6 +124,17 @@
                    (bridge-error
                     "PMT ES info length reserved bits are invalid at offset ~D"
                     offset))
+                 (unless (ts-assignable-pid-p elementary-pid)
+                   (bridge-error
+                    "PMT elementary PID is not assignable at offset ~D: 0x~4,'0X"
+                    offset elementary-pid))
+                 (when (gethash elementary-pid seen-elementary-pids)
+                   (bridge-error
+                    "PMT elementary PID is duplicated: 0x~4,'0X"
+                    elementary-pid))
+                 (setf (gethash elementary-pid
+                                seen-elementary-pids)
+                       t)
                  (when (> info-end streams-end)
                    (bridge-error "PMT elementary descriptor loop is truncated"))
                  (push (make-pmt-stream
@@ -123,8 +150,7 @@
      :current-next-p (logbitp 0 (aref section 5))
      :section-number (aref section 6)
      :last-section-number (aref section 7)
-     :pcr-pid (logior (ash (logand (aref section 8) #x1f) 8)
-                      (aref section 9))
+     :pcr-pid pcr-pid
      :program-descriptors
      (parse-descriptor-loop section 12 program-info-end)
      :streams (nreverse streams))))
@@ -148,6 +174,19 @@
     (when (> section-length 1021)
       (bridge-error "PMT section exceeds 1021 bytes: ~D"
                     section-length))
+    (when (zerop (program-map-table-program-number table))
+      (bridge-error "PMT program number must be non-zero"))
+    (unless (zerop (program-map-table-section-number table))
+      (bridge-error "PMT section number must be zero: ~D"
+                    (program-map-table-section-number table)))
+    (unless (zerop (program-map-table-last-section-number table))
+      (bridge-error "PMT last section number must be zero: ~D"
+                    (program-map-table-last-section-number table)))
+    (unless (ts-pcr-pid-p
+             (program-map-table-pcr-pid table))
+      (bridge-error
+       "PMT PCR PID is reserved: 0x~4,'0X"
+       (program-map-table-pcr-pid table)))
     (setf (aref section 0) #x02
           (aref section 1)
           (logior #xb0 (ldb (byte 4 8) section-length))
@@ -173,11 +212,25 @@
     (let ((offset
             (write-descriptor-loop
              (program-map-table-program-descriptors table)
-             section 12)))
+             section 12))
+          (seen-elementary-pids (make-hash-table :test #'eql)))
       (dolist (stream (program-map-table-streams table))
         (let ((info-length
                 (descriptor-loop-length
                  (pmt-stream-descriptors stream))))
+          (unless (ts-assignable-pid-p
+                   (pmt-stream-elementary-pid stream))
+            (bridge-error
+             "PMT elementary PID is not assignable: 0x~4,'0X"
+             (pmt-stream-elementary-pid stream)))
+          (when (gethash (pmt-stream-elementary-pid stream)
+                         seen-elementary-pids)
+            (bridge-error
+             "PMT elementary PID is duplicated: 0x~4,'0X"
+             (pmt-stream-elementary-pid stream)))
+          (setf (gethash (pmt-stream-elementary-pid stream)
+                         seen-elementary-pids)
+                t)
           (setf (aref section offset)
                 (pmt-stream-stream-type stream)
                 (aref section (+ offset 1))

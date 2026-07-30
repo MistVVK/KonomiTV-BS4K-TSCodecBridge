@@ -26,6 +26,46 @@
    :kind :invalid
    :sha256 "e77d6758a19e363f09a42eb4b0b00b9eb97214625d9f015dba3ee669553179cc"
    :fault :pmt-crc)
+  (:file "corrupt-opus-zero-pes-length.ts"
+   :kind :invalid
+   :sha256 "a039d8ecdf29033929953c74687e2d23444c086b5cb57571bd21fbb94546e0a1"
+   :fault :opus-zero-pes-length)
+  (:file "corrupt-pes-truncated-escr.ts"
+   :kind :invalid
+   :sha256 "e05beb3a8597346013378d74afe9b2700181bdf702e713ceb69c602f2dcda51e"
+   :fault :pes-truncated-escr)
+  (:file "corrupt-pmt-null-elementary-pid.ts"
+   :kind :invalid
+   :sha256 "d47adb148982dc0317be0122ba2b672b7662a72b9a78a01f50b96d0b0fee6937"
+   :fault :pmt-null-elementary-pid)
+  (:file "corrupt-pat-null-program-pid.ts"
+   :kind :invalid
+   :sha256 "f1ebd439e73085425e2bc5d3eabfcb73ecad7b7b3b916eebf91bce762e26b030"
+   :fault :pat-null-program-pid)
+  (:file "corrupt-pat-reserved-program-pid.ts"
+   :kind :invalid
+   :sha256 "6995ebd2fde530af1cd5d216331d68f8306b06cc100f50a532b632d67c173c22"
+   :fault :pat-reserved-program-pid)
+  (:file "corrupt-pat-duplicate-program-number.ts"
+   :kind :invalid
+   :sha256 "bee4f76280e90899e2fcdc94278e94965043555db1227ea50ef1acc730b70e97"
+   :fault :pat-duplicate-program-number)
+  (:file "corrupt-pmt-zero-program-number.ts"
+   :kind :invalid
+   :sha256 "2db7ffa7491ba99139269c87be87c6ec8164915be375ba072456d30d6306ac6e"
+   :fault :pmt-zero-program-number)
+  (:file "corrupt-pmt-reserved-elementary-pid.ts"
+   :kind :invalid
+   :sha256 "4d7fa45578ddb5e18fe796ba077c7a0a19bf5b0e2ae75457e3050d0f7cbf78a2"
+   :fault :pmt-reserved-elementary-pid)
+  (:file "corrupt-pmt-reserved-pcr-pid.ts"
+   :kind :invalid
+   :sha256 "4afea833b2586c30460cdf67dfb0bb48f8ba41297110ae37b5078a1c2ac95fd6"
+   :fault :pmt-reserved-pcr-pid)
+  (:file "corrupt-pmt-duplicate-elementary-pid.ts"
+   :kind :invalid
+   :sha256 "eded6746bd48324b5ea21e4f7f69c6e2a77c69ed303b681ef7524d6fde840742"
+   :fault :pmt-duplicate-elementary-pid)
   (:file "corrupt-video-cc.ts"
    :kind :invalid
    :sha256 "94c2ad56dd8f47cf8a2700df1d27ed061cad4cb3f8906e991135c3bae7fa390a"

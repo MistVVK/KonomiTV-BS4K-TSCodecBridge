@@ -5,6 +5,17 @@
 (defconstant +ts-sync-byte+ #x47)
 (defconstant +ts-null-pid+ #x1fff)
 
+(defun ts-assignable-pid-p (pid)
+  "PIDがnetwork、program map、elementary streamへ割当可能なら真。"
+  (<= #x0010 pid #x1ffe))
+
+(defun ts-pcr-pid-p (pid)
+  "PIDがPCR_PIDとして予約値を避けた値またはno-PCR値なら真。"
+  (or (= pid 0)
+      (= pid 1)
+      (ts-assignable-pid-p pid)
+      (= pid +ts-null-pid+)))
+
 (defun validate-ts-adaptation-field (packet)
   "PACKETのadaptation field長とflag依存field境界を検証する。"
   (let ((control (ldb (byte 2 4) (aref packet 3))))

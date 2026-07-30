@@ -9,8 +9,9 @@
 
 - 自作 generator が生成する PAT、PMT、PES、PCR、descriptor。
 - codec payload として意味を持たない最小の境界検査用 byte 列。
-- CRC、length、continuity counter、descriptor version を意図的に壊した
-  corruption corpus。
+- CRC、length、continuity counter、descriptor version、PSI の予約 PID
+  範囲、program / elementary PID の重複を意図的に壊した corruption
+  corpus。
 - generator の version と出力 SHA-256。
 
 収録しないもの:

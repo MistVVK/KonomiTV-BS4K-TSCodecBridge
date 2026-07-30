@@ -228,6 +228,10 @@
     (unless (= (pes-header-stream-id header) #xbd)
       (bridge-error "Opus PES stream id is invalid: 0x~2,'0X"
                     (pes-header-stream-id header)))
+    ;; PES_packet_length=0 はTS内のvideo elementary streamだけに許される。
+    ;; private_stream_1で搬送するOpus音声をunboundedとして受理してはならない。
+    (when (zerop (pes-header-packet-length header))
+      (bridge-error "Opus PES packet length must be non-zero"))
     (unless (pes-header-pts header)
       (bridge-error "Opus PES does not carry a PTS"))
     (parse-ffmpeg-opus-control-payload

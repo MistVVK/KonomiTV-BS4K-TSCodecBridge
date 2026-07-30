@@ -59,10 +59,30 @@
                 ,(subseq vp9 0 (- (length vp9) 17)))
                ("corrupt-pmt-crc.ts"
                 ,(corrupt-pmt-crc-octets vp9))
+               ("corrupt-pat-null-program-pid.ts"
+                ,(corrupt-pat-null-program-pid-octets vp9))
+               ("corrupt-pat-reserved-program-pid.ts"
+                ,(corrupt-pat-reserved-program-pid-octets vp9))
+               ("corrupt-pat-duplicate-program-number.ts"
+                ,(corrupt-pat-duplicate-program-number-octets vp9))
+               ("corrupt-pmt-null-elementary-pid.ts"
+                ,(corrupt-pmt-null-elementary-pid-octets vp9))
+               ("corrupt-pmt-zero-program-number.ts"
+                ,(corrupt-pmt-zero-program-number-octets vp9))
+               ("corrupt-pmt-reserved-elementary-pid.ts"
+                ,(corrupt-pmt-reserved-elementary-pid-octets vp9))
+               ("corrupt-pmt-reserved-pcr-pid.ts"
+                ,(corrupt-pmt-reserved-pcr-pid-octets vp9))
+               ("corrupt-pmt-duplicate-elementary-pid.ts"
+                ,(corrupt-pmt-duplicate-elementary-pid-octets vp9))
                ("corrupt-video-cc.ts"
                 ,(corrupt-video-continuity-octets vp9))
                ("corrupt-opus-lacing.ts"
                 ,(corrupt-opus-lacing-octets vp9))
+               ("corrupt-opus-zero-pes-length.ts"
+                ,(corrupt-opus-zero-pes-length-octets vp9))
+               ("corrupt-pes-truncated-escr.ts"
+                ,(corrupt-pes-truncated-escr-octets vp9))
                ("corrupt-vp9-reference-scale.ts"
                 ,(packet-list-to-octets
                   (make-public-vp9-opus-fixture-packets
@@ -143,6 +163,14 @@
            '("corrupt-sync.ts"
              "corrupt-truncated-packet.ts"
              "corrupt-pmt-crc.ts"
+             "corrupt-pat-null-program-pid.ts"
+             "corrupt-pat-reserved-program-pid.ts"
+             "corrupt-pat-duplicate-program-number.ts"
+             "corrupt-pmt-null-elementary-pid.ts"
+             "corrupt-pmt-zero-program-number.ts"
+             "corrupt-pmt-reserved-elementary-pid.ts"
+             "corrupt-pmt-reserved-pcr-pid.ts"
+             "corrupt-pmt-duplicate-elementary-pid.ts"
              "corrupt-video-cc.ts"))
     (check-bridge-test
      (signals-bridge-error-p
@@ -152,16 +180,39 @@
      name))
   (check-bridge-test
    (signals-bridge-error-p
-    (lambda ()
+   (lambda ()
       (run-validating-fast-path
        (read-fixture-octets "corrupt-video-cc.ts"))))
    "corrupt-video-cc.ts default fast path")
-  (check-bridge-test
-   (signals-bridge-error-p
-    (lambda ()
-      (run-octet-processor
-       (read-fixture-octets "corrupt-opus-lacing.ts")
-       :vp9 :opus))))
+  (dolist
+      (name
+       '("corrupt-pat-null-program-pid.ts"
+         "corrupt-pat-reserved-program-pid.ts"
+         "corrupt-pat-duplicate-program-number.ts"
+         "corrupt-pmt-null-elementary-pid.ts"
+         "corrupt-pmt-zero-program-number.ts"
+         "corrupt-pmt-reserved-elementary-pid.ts"
+         "corrupt-pmt-reserved-pcr-pid.ts"
+         "corrupt-pmt-duplicate-elementary-pid.ts"))
+    (check-bridge-test
+     (signals-bridge-error-p
+      (lambda ()
+        (run-octet-processor
+         (read-fixture-octets name)
+         :vp9 :opus)))
+     name))
+  (dolist
+      (name
+       '("corrupt-opus-lacing.ts"
+         "corrupt-opus-zero-pes-length.ts"
+         "corrupt-pes-truncated-escr.ts"))
+    (check-bridge-test
+     (signals-bridge-error-p
+      (lambda ()
+        (run-octet-processor
+         (read-fixture-octets name)
+         :vp9 :opus)))
+     name))
   (dolist
       (name
        '("corrupt-vp9-reference-scale.ts"

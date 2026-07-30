@@ -601,7 +601,7 @@
         processor))))
     (feed-test-processor-packets
      processor
-     (make-test-pmt-packets-for-video #x106 8 5))
+     (make-test-pmt-packets-for-video #x107 8 5))
     (check-bridge-test
      (vp9-test-state-empty-p
       (bridge-processor-vp9-validation-state
@@ -700,6 +700,13 @@
             input :passthrough :opus)))
     (check-bridge-test
      (= (validate-ffmpeg-opus-pes first-pes) 1920))
+    (let ((zero-length-pes (copy-seq first-pes)))
+      (setf (aref zero-length-pes 4) 0
+            (aref zero-length-pes 5) 0)
+      (check-bridge-test
+       (signals-bridge-error-p
+        (lambda ()
+          (validate-ffmpeg-opus-pes zero-length-pes)))))
     (dolist (packet (append first-packets second-packets))
       (check-bridge-test
        (find packet output :test #'equalp)))))

@@ -16,10 +16,12 @@
 
 (defun parse-pat-section (section)
   "PAT SECTIONをPROGRAM-ASSOCIATION-TABLEへ変換する。"
+  (ensure-octet-range section 0 12 :parse-pat-section)
   (validate-long-psi-section section #x00)
   (let* ((entries-end (- (length section) 4))
          (entries-length (- entries-end 8))
-         (programs '()))
+         (programs '())
+         (seen-program-numbers (make-hash-table :test #'eql)))
     (unless (zerop (mod entries-length 4))
       (bridge-error "PAT program loop is not a multiple of four bytes: ~D"
                     entries-length))
@@ -33,6 +35,15 @@
                (bridge-error
                 "PAT program PID reserved bits are invalid at offset ~D"
                 offset))
+             (unless (ts-assignable-pid-p pid)
+               (bridge-error
+                "PAT program PID is not assignable at offset ~D: 0x~4,'0X"
+                offset pid))
+             (when (gethash program-number seen-program-numbers)
+               (bridge-error
+                "PAT program number is duplicated: ~D"
+                program-number))
+             (setf (gethash program-number seen-program-numbers) t)
              (push (make-pat-program
                     :program-number program-number
                     :pid pid)
@@ -72,9 +83,27 @@
           (program-association-table-section-number table)
           (aref section 7)
           (program-association-table-last-section-number table))
-    (loop for program in programs
+    (loop with seen-program-numbers =
+            (make-hash-table :test #'eql)
+          for program in programs
           for offset from 8 by 4
-          do (write-u16-be (pat-program-program-number program)
+          do (unless (ts-assignable-pid-p
+                      (pat-program-pid program))
+               (bridge-error
+                "PAT program PID is not assignable: 0x~4,'0X"
+                (pat-program-pid program)))
+             (when (gethash
+                    (pat-program-program-number program)
+                    seen-program-numbers)
+               (bridge-error
+                "PAT program number is duplicated: ~D"
+                (pat-program-program-number program)))
+             (setf
+              (gethash
+               (pat-program-program-number program)
+               seen-program-numbers)
+              t)
+             (write-u16-be (pat-program-program-number program)
                            section offset)
              (setf (aref section (+ offset 2))
                    (logior #xe0

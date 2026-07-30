@@ -228,6 +228,30 @@ for corrupt_name in \
     fi
 done
 
+for corrupt_name in \
+    corrupt-pat-null-program-pid.ts \
+    corrupt-pat-reserved-program-pid.ts \
+    corrupt-pat-duplicate-program-number.ts \
+    corrupt-pmt-null-elementary-pid.ts \
+    corrupt-pmt-zero-program-number.ts \
+    corrupt-pmt-reserved-elementary-pid.ts \
+    corrupt-pmt-reserved-pcr-pid.ts \
+    corrupt-pmt-duplicate-elementary-pid.ts \
+    corrupt-opus-lacing.ts \
+    corrupt-opus-zero-pes-length.ts \
+    corrupt-pes-truncated-escr.ts; do
+    if "${bridge_binary}" \
+        --video-codec vp9 \
+        --audio-codec opus \
+        < "${project_root}/tests/fixtures/${corrupt_name}" \
+        > "${temporary_directory}/${corrupt_name}.stdout" \
+        2> "${temporary_directory}/${corrupt_name}.stderr"; then
+        printf 'Corrupt semantic input unexpectedly succeeded: %s\n' \
+            "${corrupt_name}" >&2
+        exit 1
+    fi
+done
+
 exact_duplicate="${temporary_directory}/semantic-exact-duplicate.ts"
 dd if="${valid_fixture}" of="${exact_duplicate}" \
     bs=188 count=6 status=none

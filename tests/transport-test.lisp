@@ -313,4 +313,515 @@
     (check-bridge-test (pes-header-data-alignment-p header))
     (check-bridge-test
      (equalp (subseq pes (pes-header-payload-offset header))
-             payload))))
+             payload))
+    (let ((scrambled (copy-seq pes)))
+      (setf (aref scrambled 6)
+            (logior (aref scrambled 6) #x10))
+      (check-bridge-test
+       (signals-bridge-error-p
+        (lambda ()
+          (parse-pes-header scrambled)))))
+    (let ((truncated-escr
+            (make-pes #xbd payload 90000)))
+      (setf (aref truncated-escr 7) #xa0)
+      (check-bridge-test
+       (signals-bridge-error-p
+        (lambda ()
+          (parse-pes-header truncated-escr)))))
+    (let* ((escr (octets #xc4 0 #x04 0 #x04 #x01))
+           (payload-offset (pes-header-payload-offset header))
+           (extended
+             (concatenate-octets
+              (subseq pes 0 payload-offset)
+              escr
+              payload)))
+      (setf (aref extended 7)
+            (logior (aref extended 7) #x20)
+            (aref extended 8)
+            (+ (aref extended 8) (length escr)))
+      (write-u16-be (+ (pes-header-packet-length header)
+                       (length escr))
+                    extended 4)
+      (let ((extended-header (parse-pes-header extended)))
+        (check-bridge-test
+         (equalp
+          (subseq extended
+                  (pes-header-payload-offset extended-header))
+          payload)))
+      (setf (aref extended (+ payload-offset 2))
+            (logand (aref extended (+ payload-offset 2))
+                    #xfb))
+      (check-bridge-test
+       (signals-bridge-error-p
+        (lambda ()
+          (parse-pes-header extended)))))
+    (check-bridge-test
+     (signals-bridge-error-p
+      (lambda ()
+        (validate-pes-escr-field
+         (octets #x04 0 #x04 0 #x04 #x01)
+         0 6))))
+    (check-bridge-test
+     (= (validate-pes-es-rate-field
+         (octets #x80 0 #x03) 0 3)
+        3))
+    (check-bridge-test
+     (signals-bridge-error-p
+      (lambda ()
+        (validate-pes-es-rate-field
+         (octets 0 0 #x03) 0 3))))
+    (check-bridge-test
+     (= (validate-pes-trick-mode-field
+         (octets #x47) 0 1)
+        1))
+    (check-bridge-test
+     (= (validate-pes-trick-mode-field
+         (octets 0) 0 1)
+        1))
+    (check-bridge-test
+     (signals-bridge-error-p
+      (lambda ()
+        (validate-pes-trick-mode-field
+         (octets #x40) 0 1))))
+    (check-bridge-test
+     (signals-bridge-error-p
+      (lambda ()
+        (validate-pes-trick-mode-field
+         (octets #x20) 0 1))))
+    (check-bridge-test
+     (= (validate-pes-extension-field
+         (octets #x0f #x81 #xff) 0 3 #xbd)
+        3))
+    (check-bridge-test
+     (signals-bridge-error-p
+      (lambda ()
+        (validate-pes-extension-field
+         (octets #x0f #x01 #xff) 0 3 #xbd))))
+    (let ((tref-extension
+            (concatenate-octets
+             (octets #x0f #x86 #xfe)
+             (encode-pes-timestamp 90000 #x0f))))
+      (check-bridge-test
+       (= (validate-pes-extension-field
+           tref-extension 0 (length tref-extension) #xbd)
+          (length tref-extension)))
+      (setf (aref tref-extension 3)
+            (logand (aref tref-extension 3) #x7f))
+      (check-bridge-test
+       (signals-bridge-error-p
+        (lambda ()
+          (validate-pes-extension-field
+           tref-extension 0 (length tref-extension) #xbd)))))
+    (check-bridge-test
+     (= (validate-pes-extension-field
+         (octets #x0f #x81 #x01) 0 3 #xfd)
+        3))
+    (check-bridge-test
+     (signals-bridge-error-p
+      (lambda ()
+        (validate-pes-extension-field
+         (octets #x0f #x81 #x01) 0 3 #xbd))))
+    (check-bridge-test
+     (signals-bridge-error-p
+      (lambda ()
+        (parse-pes-header
+         (make-pes #xfd payload 90000)))))
+    (let* ((source (make-pes #xfd payload 90000))
+           (source-payload-offset (+ 9 (aref source 8)))
+           (extension (octets #x0f #x81 #x01))
+           (extended
+             (concatenate-octets
+              (subseq source 0 source-payload-offset)
+              extension
+              payload)))
+      (setf (aref extended 7)
+            (logior (aref extended 7) #x01)
+            (aref extended 8)
+            (+ (aref extended 8) (length extension)))
+      (write-u16-be
+       (+ (read-u16-be source 4) (length extension))
+       extended 4)
+      (let ((extended-header (parse-pes-header extended)))
+        (check-bridge-test
+         (= (pes-header-stream-id extended-header) #xfd))
+        (check-bridge-test
+         (equalp
+          (subseq extended
+                  (pes-header-payload-offset extended-header))
+          payload))))
+    (check-bridge-test
+     (signals-bridge-error-p
+      (lambda ()
+        (validate-pes-extension-field
+         (octets #x2e) 0 1 #xbd))))
+    (let ((crc-pes
+            (make-pes #xbd payload 90000)))
+      (setf (aref crc-pes 7)
+            (logior (aref crc-pes 7) #x02))
+      (check-bridge-test
+       (signals-bridge-error-p
+        (lambda ()
+          (parse-pes-header crc-pes)))))
+    (let* ((source (make-pes #xbd payload 90000))
+           (source-payload-offset
+             (pes-header-payload-offset
+              (parse-pes-header source)))
+           (crc-field (octets #x12 #x34))
+           (extended
+             (concatenate-octets
+              (subseq source 0 source-payload-offset)
+              crc-field
+              payload)))
+      (setf (aref extended 7)
+            (logior (aref extended 7) #x02)
+            (aref extended 8)
+            (+ (aref extended 8) (length crc-field)))
+      (write-u16-be
+       (+ (read-u16-be source 4) (length crc-field))
+       extended 4)
+      ;; CRC field自体の長さが妥当でも、直前PES payloadを検証できない
+      ;; 単一packet parserではfail closedにする。
+      (check-bridge-test
+       (signals-bridge-error-p
+        (lambda ()
+          (parse-pes-header extended)))))
+    (check-bridge-test
+     (signals-bridge-error-p
+      (lambda ()
+        ;; 両markerとoriginal_stuff_lengthが妥当でも、program全体の
+        ;; sequence状態を検証できないためfail closedにする。
+        (validate-pes-extension-field
+         (octets #x2e #x85 #xc3) 0 3 #xbd))))
+    (check-bridge-test
+     (= (validate-pes-extension-field
+         (octets #x1e #x40 0) 0 3 #xbd)
+        3))
+    (check-bridge-test
+     (= (validate-pes-extension-field
+         (octets #x1e #x60 0) 0 3 #xe0)
+        3))
+    (dolist (bad-p-std
+             (list
+              (list (octets #x1e #x60 0) #xc0)
+              (list (octets #x1e #x40 0) #xe0)))
+      (check-bridge-test
+       (signals-bridge-error-p
+        (lambda ()
+          (validate-pes-extension-field
+           (first bad-p-std)
+           0
+           (length (first bad-p-std))
+           (second bad-p-std))))))
+    (let ((private-data
+            (concatenate-octets
+             (octets #x8e)
+             (make-array
+              16
+              :element-type 'octet
+              :initial-element #x55))))
+      (check-bridge-test
+       (= (validate-pes-extension-field
+           private-data 0 (length private-data) #xbd)
+          (length private-data)))
+      (setf (aref private-data 1) 0
+            (aref private-data 2) 0
+            (aref private-data 3) 1)
+      (check-bridge-test
+       (signals-bridge-error-p
+        (lambda ()
+          (validate-pes-extension-field
+           private-data 0 (length private-data) #xbd)))))
+    (let ((boundary
+            (make-array
+             20
+             :element-type 'octet
+             :initial-element #x55)))
+      (setf (aref boundary 0) 0
+            (aref boundary 1) 0
+            (aref boundary 2) 1)
+      (check-bridge-test
+       (signals-bridge-error-p
+        (lambda ()
+          (validate-pes-private-data-field boundary 2 18))))
+      (fill boundary #x55)
+      (setf (aref boundary 17) 0
+            (aref boundary 18) 0
+            (aref boundary 19) 1)
+      (check-bridge-test
+       (signals-bridge-error-p
+        (lambda ()
+          (validate-pes-private-data-field boundary 2 20)))))
+    (let* ((source
+             (make-pes #xbd (octets 0 1 #x55) 90000))
+           (payload-offset
+             (pes-header-payload-offset
+              (parse-pes-header source)))
+           (private-bytes
+             (make-array
+              16
+              :element-type 'octet
+              :initial-element #x55))
+           (extension
+             (concatenate-octets
+              (octets #x8e)
+              private-bytes))
+           (extended
+             (concatenate-octets
+              (subseq source 0 payload-offset)
+              extension
+              (subseq source payload-offset))))
+      (setf (aref private-bytes 15) 0
+            (aref extended
+                  (+ payload-offset (length extension) -1))
+            0
+            (aref extended 7)
+            (logior (aref extended 7) #x01)
+            (aref extended 8)
+            (+ (aref extended 8) (length extension)))
+      (write-u16-be
+       (+ (read-u16-be source 4) (length extension))
+       extended 4)
+      (check-bridge-test
+       (signals-bridge-error-p
+        (lambda ()
+          (parse-pes-header extended)))))
+    (let* ((mpeg-two-pack
+             (octets
+              0 0 1 #xba
+              #x44 0 #x04 0 #x04 #x01
+              0 0 #x07 #xf8))
+           (mpeg-one-pack
+             (octets
+              0 0 1 #xba
+              #x21 0 #x01 0 #x01 #x80 0 #x03))
+           (system-header
+             (octets
+              0 0 1 #xbb 0 6
+              #x80 0 #x03 0 #x20 #x7f))
+           (mpeg-one-system-header
+             (octets
+              0 0 1 #xbb 0 6
+              #x80 0 #x03 0 #x20 #xff))
+           (pack-with-system
+             (concatenate-octets
+              mpeg-two-pack system-header))
+           (mpeg-one-pack-with-system
+             (concatenate-octets
+              mpeg-one-pack mpeg-one-system-header))
+           (pack-extension
+             (concatenate-octets
+              (octets #x4e (length pack-with-system))
+              pack-with-system)))
+      (check-bridge-test
+       (= (validate-program-stream-pack-header
+           mpeg-two-pack 0 (length mpeg-two-pack))
+          (length mpeg-two-pack)))
+      (check-bridge-test
+       (= (validate-program-stream-pack-header
+           mpeg-one-pack 0 (length mpeg-one-pack))
+          (length mpeg-one-pack)))
+      (check-bridge-test
+       (= (validate-program-stream-pack-header
+           mpeg-one-pack-with-system
+           0
+           (length mpeg-one-pack-with-system))
+          (length mpeg-one-pack-with-system)))
+      (check-bridge-test
+       (= (validate-pes-extension-field
+           pack-extension 0 (length pack-extension) #xbd)
+          (length pack-extension)))
+      (let ((bad-marker (copy-seq mpeg-two-pack)))
+        (setf (aref bad-marker 12)
+              (logand (aref bad-marker 12) #xfe))
+        (check-bridge-test
+         (signals-bridge-error-p
+          (lambda ()
+            (validate-program-stream-pack-header
+             bad-marker 0 (length bad-marker))))))
+      (let* ((bad-system (copy-seq system-header))
+             (bad-pack
+               (concatenate-octets
+                mpeg-two-pack bad-system)))
+        (setf (aref bad-pack
+                    (+ (length mpeg-two-pack) 9))
+              #x84)
+        (check-bridge-test
+         (signals-bridge-error-p
+          (lambda ()
+            (validate-program-stream-pack-header
+             bad-pack 0 (length bad-pack))))))
+      (let ((bad-rate
+              (copy-seq pack-with-system)))
+        (setf (aref bad-rate 12) #x0b)
+        (check-bridge-test
+         (signals-bridge-error-p
+          (lambda ()
+            (validate-program-stream-pack-header
+             bad-rate 0 (length bad-rate))))))
+      (let ((bad-rate
+              (copy-seq mpeg-one-pack-with-system)))
+        (setf (aref bad-rate 11) #x05)
+        (check-bridge-test
+         (signals-bridge-error-p
+          (lambda ()
+            (validate-program-stream-pack-header
+             bad-rate 0 (length bad-rate))))))
+      (let ((bad-reserved
+              (copy-seq mpeg-one-pack-with-system)))
+        (setf (aref bad-reserved
+                    (+ (length mpeg-one-pack) 11))
+              #x7f)
+        (check-bridge-test
+         (signals-bridge-error-p
+          (lambda ()
+            (validate-program-stream-pack-header
+             bad-reserved 0 (length bad-reserved))))))
+      (let* ((auxiliary-system
+               (octets
+                0 0 1 #xbb 0 12
+                #x80 0 #x03 0 #x20 #x7f
+                #xb7 #xc0 #x10 #xb6 #xe0 #x01))
+             (auxiliary-pack
+               (concatenate-octets
+                mpeg-two-pack auxiliary-system)))
+        (check-bridge-test
+         (= (validate-program-stream-pack-header
+             auxiliary-pack 0 (length auxiliary-pack))
+            (length auxiliary-pack)))
+        (let ((bad-scale (copy-seq auxiliary-pack)))
+          (setf (aref bad-scale
+                      (+ (length mpeg-two-pack) 16))
+                #xc0)
+          (check-bridge-test
+           (signals-bridge-error-p
+            (lambda ()
+              (validate-program-stream-pack-header
+               bad-scale 0 (length bad-scale))))))
+        (let ((mpeg-one-auxiliary
+                (concatenate-octets
+                 mpeg-one-pack auxiliary-system)))
+          (setf (aref mpeg-one-auxiliary
+                      (+ (length mpeg-one-pack) 11))
+                #xff)
+          (check-bridge-test
+           (signals-bridge-error-p
+            (lambda ()
+              (validate-program-stream-pack-header
+               mpeg-one-auxiliary
+               0
+               (length mpeg-one-auxiliary)))))))
+      (let ((stuffed
+              (concatenate-octets
+               mpeg-two-pack (octets #xff))))
+        (setf (aref stuffed 13) #xf9)
+        (check-bridge-test
+         (= (validate-program-stream-pack-header
+             stuffed 0 (length stuffed))
+            (length stuffed)))
+        (let ((bad-stuffing (copy-seq stuffed)))
+          (setf (aref bad-stuffing 14) 0)
+          (check-bridge-test
+           (signals-bridge-error-p
+            (lambda ()
+              (validate-program-stream-pack-header
+               bad-stuffing 0 (length bad-stuffing))))))
+        (let ((truncated (subseq stuffed 0 14)))
+          (check-bridge-test
+           (signals-bridge-error-p
+            (lambda ()
+              (validate-program-stream-pack-header
+               truncated 0 (length truncated)))))))
+      (let ((bad-scr-extension
+              (copy-seq mpeg-two-pack)))
+        (setf (aref bad-scr-extension 8) #x06
+              (aref bad-scr-extension 9) #x59)
+        (check-bridge-test
+         (signals-bridge-error-p
+          (lambda ()
+            (validate-program-stream-pack-header
+             bad-scr-extension
+             0
+             (length bad-scr-extension))))))
+      (let ((zero-rate
+              (copy-seq mpeg-two-pack)))
+        (setf (aref zero-rate 10) 0
+              (aref zero-rate 11) 0
+              (aref zero-rate 12) #x03)
+        (check-bridge-test
+         (signals-bridge-error-p
+          (lambda ()
+            (validate-program-stream-pack-header
+             zero-rate 0 (length zero-rate))))))
+      (let* ((duplicate-system
+               (octets
+                0 0 1 #xbb 0 12
+                #x80 0 #x03 0 #x20 #x7f
+                #xc0 #xc0 #x01
+                #xc0 #xc0 #x01))
+             (duplicate-pack
+               (concatenate-octets
+                mpeg-two-pack duplicate-system)))
+        (check-bridge-test
+         (signals-bridge-error-p
+          (lambda ()
+            (validate-program-stream-pack-header
+             duplicate-pack 0 (length duplicate-pack))))))
+      (let* ((duplicate-extended-system
+               (octets
+                0 0 1 #xbb 0 18
+                #x80 0 #x03 0 #x20 #x7f
+                #xb7 #xc0 #x10 #xb6 #xe0 #x01
+                #xb7 #xc0 #x10 #xb6 #xe0 #x01))
+             (duplicate-extended-pack
+               (concatenate-octets
+                mpeg-two-pack duplicate-extended-system)))
+        (check-bridge-test
+         (signals-bridge-error-p
+          (lambda ()
+            (validate-program-stream-pack-header
+             duplicate-extended-pack
+             0
+             (length duplicate-extended-pack))))))
+      (dolist
+          (overlapping-system
+           (list
+            (octets
+             0 0 1 #xbb 0 12
+             #x80 0 #x03 0 #x20 #x7f
+             #xb8 #xc0 #x01
+             #xc0 #xc0 #x01)
+            (octets
+             0 0 1 #xbb 0 12
+             #x80 0 #x03 0 #x20 #x7f
+             #xb9 #xe0 #x01
+             #xe0 #xe0 #x01)
+            (octets
+             0 0 1 #xbb 0 15
+             #x80 0 #x03 0 #x20 #x7f
+             #xfd #xc0 #x01
+             #xb7 #xc0 #x10 #xb6 #xe0 #x01)
+            (octets
+             0 0 1 #xbb 0 15
+             #x80 0 #x03 0 #x20 #x7f
+             #xb9 #xe0 #x01
+             #xb7 #xc0 #x10 #xb6 #xe0 #x01)))
+        (let ((overlapping-pack
+                (concatenate-octets
+                 mpeg-two-pack overlapping-system)))
+          (check-bridge-test
+           (signals-bridge-error-p
+            (lambda ()
+              (validate-program-stream-pack-header
+               overlapping-pack
+               0
+               (length overlapping-pack)))))))
+      (check-bridge-test
+       (signals-bridge-error-p
+        (lambda ()
+          (validate-pes-extension-field
+           (octets #x4e 0) 0 2 #xbd)))))
+    (check-bridge-test
+     (signals-bridge-error-p
+      (lambda ()
+        (validate-pes-header-stuffing
+         (octets 0) 0 1))))))
