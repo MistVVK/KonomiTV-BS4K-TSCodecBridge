@@ -4,53 +4,53 @@
  :fixtures
   ((:file "valid-vp9-opus.ts"
    :kind :valid
-   :sha256 "46ab5930ff281db2d9f7f7edc046069ebeafa12e40debe6d3dea1b6a8131adb0"
-   :contains (:pat :pmt :pcr :vp9 :two-opus :timed-id3 :data))
+   :sha256 "de677c4ae55f7970e2b925f7b370500ea1ec600d1520957d76dd4e5f25eb1117"
+   :contains (:pat :pmt :pcr :vp9 :two-opus :timed-id3 :data :subtitle))
   (:file "valid-vp9-superframe.ts"
    :kind :valid
-   :sha256 "80a1937b5a28f67eaa5472ce41bce07ac04be6ff58092629e6ebc307dda8f6ac"
-   :contains (:pat :pmt :pcr :vp9 :mixed-size-superframe))
+   :sha256 "9b96d3a61d4a238cedc9b05c015743628341a926e3c658a1277641adabc08e2b"
+   :contains (:pat :pmt :pcr :vp9 :mixed-size-superframe :subtitle))
   (:file "valid-av1-aac.ts"
    :kind :valid
-   :sha256 "37e7dfcaca45eac368f1c8b858587ff1f16e5f0b68bf326dfc66bf9dae800428"
-   :contains (:pat :pmt :av1 :aac :timed-id3 :data))
+   :sha256 "692e802eb5c1bf4a3a76effbe0b7051afeffa541731996765df1629fad34ba10"
+   :contains (:pat :pmt :av1 :aac :timed-id3 :data :subtitle))
   (:file "corrupt-sync.ts"
    :kind :invalid
-   :sha256 "be802370f49b75aeccd4360b8479055b82ee5cf63fffeb4d275d5909c5f8e024"
+   :sha256 "a2bca1cc1b1e8f8324fbfa24041eac76b75ef5fac70b24a06f4f1c25301ad5b0"
    :fault :sync-byte)
   (:file "corrupt-truncated-packet.ts"
    :kind :invalid
-   :sha256 "7a19f9eec152ecda6e45251b2f9d5c638058d83acb17719b4ba6580207be4008"
+   :sha256 "52a0dab4ddc650d7b9d22076b4cddeb330abc1fb25a3ce35fc2eaaafa51b674d"
    :fault :truncated-transport-packet)
   (:file "corrupt-pmt-crc.ts"
    :kind :invalid
-   :sha256 "b8ed4644f86513ea82e556b585182d32e747d6e38748a48eb306c72234f1adc8"
+   :sha256 "e77d6758a19e363f09a42eb4b0b00b9eb97214625d9f015dba3ee669553179cc"
    :fault :pmt-crc)
   (:file "corrupt-video-cc.ts"
    :kind :invalid
-   :sha256 "d58a61ebf3ef98a9ab7a00819c68a679ea4a229b1c5a6ddea958a4e31dea1173"
+   :sha256 "94c2ad56dd8f47cf8a2700df1d27ed061cad4cb3f8906e991135c3bae7fa390a"
    :fault :video-continuity-counter)
   (:file "corrupt-opus-lacing.ts"
    :kind :invalid
-   :sha256 "27dcc49d6e6ab8a332e43bc27fc108cd68e25eefb5a2469cc979c501c586a88f"
+   :sha256 "14fc03ee5b3cf5c9bac4a4d63f9d3fb6b1115ba6d6c4467f7aac6c676e9d79cb"
    :fault :opus-control-lacing)
   (:file "corrupt-vp9-reference-scale.ts"
    :kind :invalid
-   :sha256 "98bd95bb728eb82f2b71f0d3ba30f9f562602e360be61984dbefb60a38f4fb28"
+   :sha256 "e1896d79684d6b74abe4b9b6bcd5bd39bc5cc67e11c0370821dd5db733132a77"
    :fault :vp9-reference-scale)
   (:file "corrupt-vp9-second-subframe.ts"
    :kind :invalid
-   :sha256 "e8b76370bdbe296df78c67d5a551beb5f0c9c7707836a2468e2d9b3922eee1dd"
+   :sha256 "585b5f005fe5663a7cbc21fcb6ed26071ee23da407c7734942fcea32dbe51737"
    :fault :vp9-second-subframe)
   (:file "corrupt-vp9-compressed-header-size.ts"
    :kind :invalid
-   :sha256 "a7b2f2ffe78ab90b989bbffed7264ec0adc36e88b8f7db019c569757199c83aa"
+   :sha256 "29e2b13ed4a9742d1a089a88f5e6417313d329f6011f706cea65dfd7782109f5"
    :fault :vp9-compressed-header-size)
   (:file "corrupt-vp9-tile-size.ts"
    :kind :invalid
-   :sha256 "26cfd12a08c5cc833d0e938b40ca9d3d19e129617d16dfd018a3dd325a970105"
+   :sha256 "1615ef00a36f29d94dea6663a55c039dd61483682b66eeca62b51ec13723726e"
    :fault :vp9-tile-size)
   (:file "corrupt-vp9-reserved-color-space.ts"
    :kind :invalid
-   :sha256 "f532ae64750e266c9341aae6a775184a8ea99bd1687af06fd8d4a99547fde575"
+   :sha256 "e8c15af3ec1608d62390de7395504df08206de69875dfe4ae5d200bece4bdea5"
    :fault :vp9-reserved-color-space)))

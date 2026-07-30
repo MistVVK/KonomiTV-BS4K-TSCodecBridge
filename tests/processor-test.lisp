@@ -8,6 +8,7 @@
 (defconstant +test-audio-two-pid+ #x103)
 (defconstant +test-timed-id3-pid+ #x104)
 (defconstant +test-data-pid+ #x105)
+(defconstant +test-subtitle-pid+ #x106)
 (defconstant +test-transport-rate-kbps+ 2200)
 (defconstant +test-tstd-removal-delay-ticks+ 90000)
 
@@ -81,6 +82,14 @@
         (make-test-opus-descriptors
          1 :registration opus-registration-p))))
     (list
+     (make-pmt-stream
+      :stream-type #x06
+      :elementary-pid +test-subtitle-pid+
+      :descriptors
+      (list
+       (make-descriptor
+        :tag #xfd
+        :payload (octets #x00 #x08))))
      (make-pmt-stream
       :stream-type #x15
       :elementary-pid +test-timed-id3-pid+)

@@ -56,7 +56,7 @@ soak-600:
 	SOAK_DURATION_SECONDS=600 bash scripts/soak.sh
 
 soak-24h:
-	SOAK_DURATION_SECONDS=86400 bash scripts/soak.sh
+	SOAK_MODE=av1 SOAK_DURATION_SECONDS=86400 bash scripts/soak.sh
 
 check: compile lint test fixtures-check
 

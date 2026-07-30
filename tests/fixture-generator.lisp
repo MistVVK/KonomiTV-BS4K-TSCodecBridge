@@ -45,6 +45,11 @@
            (make-ts-packet
             +test-data-pid+ 0
             (make-pattern-octets 73 33)
+            :payload-unit-start t))
+         (subtitle
+           (make-ts-packet
+            +test-subtitle-pid+ 0
+            (make-pattern-octets 83 54)
             :payload-unit-start t)))
     (append
      (make-test-pat-packets)
@@ -53,6 +58,7 @@
      (list timed-id3)
      (list (first video-packets))
      (list data)
+     (list subtitle)
      (rest video-packets)
      opus-two-pes
      second-pmt)))
@@ -128,7 +134,15 @@
      :elementary-pid +test-timed-id3-pid+)
     (make-pmt-stream
      :stream-type #x0d
-     :elementary-pid +test-data-pid+))))
+     :elementary-pid +test-data-pid+)
+    (make-pmt-stream
+     :stream-type #x06
+     :elementary-pid +test-subtitle-pid+
+     :descriptors
+     (list
+      (make-descriptor
+       :tag #xfd
+       :payload (octets #x00 #x08)))))))
 
 (defun make-public-av1-aac-fixture-packets ()
   "公開fixture用AV1+AAC TS packet列を決定的に作る。"
@@ -167,6 +181,11 @@
            (make-ts-packet
             +test-data-pid+ 12
             (make-pattern-octets 100 19)
+            :payload-unit-start t))
+         (subtitle
+           (make-ts-packet
+            +test-subtitle-pid+ 9
+            (make-pattern-octets 91 84)
             :payload-unit-start t)))
     (append
      (make-test-pat-packets)
@@ -174,7 +193,7 @@
      audio
      (list timed-id3)
      video
-     (list data))))
+     (list data subtitle))))
 
 (defun corrupt-sync-octets (octets)
   "OCTETSの2 packet目のsync byteを壊す。"

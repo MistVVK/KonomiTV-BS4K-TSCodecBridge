@@ -730,6 +730,10 @@
       (private-descriptors
        (bridge-error
         "Input private video PID has an unknown private mapping"))
+      ;; ARIB字幕などのprivate PESはdata_component_descriptor等で用途を
+      ;; 明示する。既知映像registrationを持たない有descriptor ESをbare
+      ;; 映像候補へ含めると字幕を第2映像と誤認するため、非対象として保持する。
+      (descriptors nil)
       (t :bare))))
 
 (defun select-video-pid (table selected-codec)
