@@ -9,9 +9,18 @@
 (defconstant +av1-signaling-change-minimum-ticks+ 90000)
 (defconstant +pcr-modulus+ (* (ash 1 33) 300))
 (defconstant +maximum-pcr-interval-ticks+ 2700000)
-(defconstant +maximum-pcr-gap-pts-ticks+ 9000)
+;; ES の DTS/PTS が PCR なしで進んでよい上限。
+;; 規格上 PCR は 100ms 以内だが、FFmpeg live + 固定 muxrate では 29.97fps で
+;; 数 frame 分 PCR 無しが連続することがあるため 500ms を許す。
+(defconstant +maximum-pcr-gap-pts-ticks+ 45000)
 (defconstant +maximum-dts-pcr-delay-ticks+ 900000)
+;; FFmpeg の低遅延 mux では起動直後に DTS が PCR より数百 ms 先行することがある。
+;; 2 秒以内の先行は許容し、それ以上だけを致命とする。
+(defconstant +maximum-dts-before-pcr-ticks+ 180000)
 (defconstant +maximum-av1-rap-gap-ticks+ 180000)
+;; FFmpeg の live MPEG-TS mux は Opus frame 境界で 90kHz PTS が ±数 tick ずれることがある。
+;; 1ms (90 ticks) 以内は実害のない丸めジッターとして rebase し、大きな飛びだけを致命とする。
+(defconstant +opus-pts-jitter-tolerance-ticks+ 90)
 (defconstant +repacketize-deadline-milliseconds+ 2)
 
 (defstruct pending-entry
@@ -320,14 +329,18 @@
                 300))
              (delay
                (mod (- timestamp pcr-base) +pts-modulus+)))
-        (when (>= delay +pts-half-modulus+)
-          (bridge-error
-           "DTS_BEFORE_PCR pcr_base=~D timestamp=~D"
-           pcr-base timestamp))
-        (when (> delay +maximum-dts-pcr-delay-ticks+)
-          (bridge-error
-           "DTS_PCR_DELAY_EXCEEDED delay_ticks=~D limit_ticks=~D"
-           delay +maximum-dts-pcr-delay-ticks+))))
+        (if (>= delay +pts-half-modulus+)
+            ;; timestamp が PCR より前。signed 最短距離で許容幅を超えたときだけ落とす。
+            (let ((behind
+                    (mod (- pcr-base timestamp) +pts-modulus+)))
+              (when (> behind +maximum-dts-before-pcr-ticks+)
+                (bridge-error
+                 "DTS_BEFORE_PCR pcr_base=~D timestamp=~D"
+                 pcr-base timestamp)))
+            (when (> delay +maximum-dts-pcr-delay-ticks+)
+              (bridge-error
+               "DTS_PCR_DELAY_EXCEEDED delay_ticks=~D limit_ticks=~D"
+               delay +maximum-dts-pcr-delay-ticks+)))))
     (let ((window-start
             (pes-assembler-pcr-window-start-timestamp
              assembler)))
@@ -3106,6 +3119,13 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
       (setf (bridge-processor-seen-video-pes-p processor) t)
       event)))
 
+(defun opus-pts-delta-ticks (expected actual)
+  "33-bit PTS 空間での signed 最短距離を返す。"
+  (let ((forward (mod (- actual expected) +pts-modulus+)))
+    (if (>= forward +pts-half-modulus+)
+        (- forward +pts-modulus+)
+        forward)))
+
 (defun validate-opus-pts-continuity (assembler pes samples)
   "ASSEMBLERのOpus PTSを可変packet durationに対して検証する。"
   (let* ((header (parse-pes-header pes))
@@ -3116,12 +3136,15 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
          (ticks (/ (* samples 90000) +opus-clock-rate+)))
     (unless (integerp ticks)
       (bridge-error "Opus duration does not map to an integer 90kHz PTS"))
-    (when (and expected
-               (not skip-p)
-               (/= pts expected))
-      (bridge-error
-       "Opus PTS discontinuity on PID 0x~4,'0X: expected=~D actual=~D"
-       (pes-assembler-pid assembler) expected pts))
+    (when (and expected (not skip-p))
+      (let ((delta (opus-pts-delta-ticks expected pts)))
+        ;; 完全一致、または FFmpeg live mux の微小ジッターだけを通す。
+        ;; 許容時は actual PTS を起点に再計算し、誤差を蓄積させない。
+        (unless (or (zerop delta)
+                    (<= (abs delta) +opus-pts-jitter-tolerance-ticks+))
+          (bridge-error
+           "Opus PTS discontinuity on PID 0x~4,'0X: expected=~D actual=~D"
+           (pes-assembler-pid assembler) expected pts))))
     (setf (pes-assembler-expected-pts assembler)
           (mod (+ pts ticks) +pts-modulus+)
           (pes-assembler-skip-next-pts-check-p assembler) nil)))

@@ -1407,7 +1407,9 @@
      (bridge-error-message-contains-p
       (lambda ()
         (validate-program-timestamp-against-pcr
-         processor assembler 99001 t))
+         processor assembler
+         (+ 90000 +maximum-pcr-gap-pts-ticks+ 1)
+         t))
       "SELECTED_PCR_GAP"))))
 
 (define-bridge-test selected-pcr-rejects-nonduplicate-stopped-clock
@@ -1561,7 +1563,8 @@
             +test-video-pid+
             (make-pes
              #xbd (make-test-vp9-key-frame 0 320 180)
-             99001 :dts 99001)
+             (+ 90000 +maximum-pcr-gap-pts-ticks+ 1)
+             :dts (+ 90000 +maximum-pcr-gap-pts-ticks+ 1))
             :continuity-counter
             (logand (length first) #x0f)
             :payload-unit-start t)))
@@ -1614,7 +1617,10 @@
             :payload-unit-start t))
          (late-opus
            (loop
-             for pts from 91800 to 100800 by 1800
+             ;; 200ms 上限を超えるまで Opus PTS を進める。
+             for pts from 91800
+               to (+ 90000 +maximum-pcr-gap-pts-ticks+ 1800)
+               by 1800
              for counter from (length first-opus)
              append
              (packetize-payload

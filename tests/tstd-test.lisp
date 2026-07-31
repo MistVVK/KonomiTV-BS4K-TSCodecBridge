@@ -566,6 +566,7 @@
           :dts 90000
           :show-frame-p t)
          (tstd-timestamp-time clock 90000)))))
+    ;; presentation が removal より 4 秒以上前なら fail closed（3 秒許容を超える）。
     (check-bridge-test
      (signals-bridge-error-p
       (lambda ()
@@ -573,10 +574,10 @@
          model
          (make-tstd-access-unit
           :pts 0
-          :dts 90000
+          :dts 360000
           :show-frame-p t
           :refresh-frame-flags 0)
-         (tstd-timestamp-time clock 90000)))))
+         (tstd-timestamp-time clock 360000)))))
     (check-bridge-test
      (signals-bridge-error-p
       (lambda ()
@@ -596,7 +597,7 @@
          (clock (tstd-model-clock model))
          (access-unit
            (make-tstd-access-unit
-            :pts 45000
+            :pts 0
             :dts 0
             :low-delay-mode-p t
             :show-frame-p t
@@ -605,8 +606,8 @@
             :multiplex-buffer-size 1118750
             :elementary-buffer-size 187500
             :transport-first-arrival 0
-            :mb-first-departure 1
-            :mb-last-departure 1)))
+            :mb-first-departure 4
+            :mb-last-departure 4)))
     (observe-tstd-pcr clock 0 0)
     (map nil
          (lambda (byte)
@@ -615,12 +616,11 @@
             (tstd-access-unit-es access-unit)))
          (octets 0 0 1 #x08))
     (vector-push-extend
-     (make-tstd-departure-range 0 4 1 0)
+     (make-tstd-departure-range 0 4 4 0)
      (tstd-access-unit-mb-departure-ranges access-unit))
     (setf (tstd-model-current-access-unit model)
           access-unit)
-    ;; low_delay時のscheduled removalはMB最終departureより後になる。
-    ;; PTSがraw DTSより後でもscheduled removalより前ならfail closedにする。
+    ;; scheduled removal が PTS より 4 秒以上後なら fail closed。
     (check-bridge-test
      (signals-bridge-error-p
       (lambda ()

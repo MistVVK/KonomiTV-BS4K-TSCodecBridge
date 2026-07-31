@@ -5,6 +5,9 @@
 (defconstant +tstd-transport-buffer-size+ 512)
 (defconstant +tstd-maximum-transport-buffer-busy-period+ 1)
 (defconstant +tstd-maximum-access-unit-delay+ 10)
+;; FFmpeg live AV1 は DTS が transport arrival より数秒先行することがある。
+;; この秒数以内なら arrival 直後へ clamp し、それを超える破綻だけ落とす。
+(defconstant +tstd-maximum-removal-before-arrival-seconds+ 3)
 (defconstant +av1-buffer-pool-size+ 10)
 (defconstant +av1-virtual-buffer-index-count+ 8)
 
@@ -800,9 +803,14 @@
            pool free-index refresh-frame-flags)))
     (when (or show-existing-p show-frame-p)
       (when (< presentation-time removal-time)
-        (bridge-error
-         "TSTD_BUFFER_POOL_PRESENTATION_BEFORE_DECODE presentation=~A removal=~A"
-         presentation-time removal-time))
+        ;; FFmpeg live AV1 では PTS が clamp 後の removal より前になることがある。
+        ;; 許容幅内は presentation を removal に揃え、それ以上だけ落とす。
+        (let ((behind (- removal-time presentation-time)))
+          (when (> behind +tstd-maximum-removal-before-arrival-seconds+)
+            (bridge-error
+             "TSTD_BUFFER_POOL_PRESENTATION_BEFORE_DECODE presentation=~A removal=~A"
+             presentation-time removal-time))
+          (setf presentation-time removal-time)))
       (setf
        (aref (tstd-buffer-pool-presentation-times pool)
              display-index)
@@ -889,30 +897,32 @@
              (tstd-timestamp-time
               (tstd-model-clock model)
               (tstd-access-unit-dts access-unit)))
-           (low-delay-p
-             (tstd-access-unit-low-delay-mode-p access-unit))
+           ;; FFmpeg live / HW AV1 は bitstream の low_delay_mode_flag が
+           ;; 立たないことが多く、厳密 DTS 除去だと起動直後に破綻する。
+           ;; MB 最終 departure 以降に除去する low-delay 相当を常に使う。
            (effective-removal-time
-             (if low-delay-p
-                 (max
-                  removal-time
-                  (+ last-departure
-                     (/ 1 +tstd-system-clock-rate+)))
-                 removal-time))
+             (max
+              removal-time
+              (+ last-departure
+                 (/ 1 +tstd-system-clock-rate+))))
            (delay (- effective-removal-time first-arrival)))
       (declare (ignore first-departure))
       (when (minusp delay)
-        (bridge-error
-         "TSTD_ACCESS_UNIT_REMOVAL_BEFORE_ARRIVAL delay=~A"
-         delay))
+        ;; それでも arrival より前なら、許容幅内は arrival 直後へ clamp する。
+        (let ((behind (- first-arrival effective-removal-time)))
+          (when (> behind +tstd-maximum-removal-before-arrival-seconds+)
+            (bridge-error
+             "TSTD_ACCESS_UNIT_REMOVAL_BEFORE_ARRIVAL delay=~A"
+             delay))
+          (setf effective-removal-time
+                (+ first-arrival
+                   (/ 1 +tstd-system-clock-rate+))
+                delay
+                (- effective-removal-time first-arrival))))
       (when (> delay +tstd-maximum-access-unit-delay+)
         (bridge-error
          "TSTD_ACCESS_UNIT_DELAY_EXCEEDED delay=~A limit=~A"
          delay +tstd-maximum-access-unit-delay+))
-      (when (and (not low-delay-p)
-                 (> last-departure removal-time))
-        (bridge-error
-         "TSTD_MB_DEPARTURE_AFTER_DTS departure=~A dts=~A"
-         last-departure removal-time))
       (let ((capacity
               (tstd-access-unit-elementary-buffer-size
                access-unit)))

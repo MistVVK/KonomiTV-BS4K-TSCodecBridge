@@ -711,6 +711,66 @@
       (check-bridge-test
        (find packet output :test #'equalp)))))
 
+(define-bridge-test opus-pts-small-jitter-is-accepted
+  "FFmpeg live mux で観測される ±2 tick 級の Opus PTS ジッターを通す。"
+  (let* ((raw-one (octets #xf8 #x10 #x20))
+         (raw-two (octets #xf8 #x30 #x40))
+         (first-pes (make-test-opus-pes 90000 raw-one))
+         ;; 20ms (1800 ticks) ではなく +2 tick の 1802 で送る。
+         (second-pes (make-test-opus-pes 91802 raw-two))
+         (first-packets
+           (packetize-payload
+            +test-audio-one-pid+ first-pes
+            :continuity-counter 0
+            :payload-unit-start t))
+         (second-packets
+           (packetize-payload
+            +test-audio-one-pid+ second-pes
+            :continuity-counter
+            (logand (length first-packets) #x0f)
+            :payload-unit-start t))
+         (input
+           (append
+            (make-test-pat-packets)
+            (make-test-pmt-packets :two-audio-p nil)
+            (list (make-test-program-pcr-packet 90000))
+            first-packets second-packets))
+         (output
+           (run-packet-processor
+            input :passthrough :opus)))
+    (dolist (packet (append first-packets second-packets))
+      (check-bridge-test
+       (find packet output :test #'equalp)))))
+
+(define-bridge-test opus-pts-large-jump-is-rejected
+  "1ms を超える Opus PTS 飛びは従来どおり致命エラーにする。"
+  (let* ((raw-one (octets #xf8 #x10 #x20))
+         (raw-two (octets #xf8 #x30 #x40))
+         (first-pes (make-test-opus-pes 90000 raw-one))
+         ;; 1800 + 91 = 1891 ticks 先。許容 90 を超える。
+         (second-pes (make-test-opus-pes 91891 raw-two))
+         (first-packets
+           (packetize-payload
+            +test-audio-one-pid+ first-pes
+            :continuity-counter 0
+            :payload-unit-start t))
+         (second-packets
+           (packetize-payload
+            +test-audio-one-pid+ second-pes
+            :continuity-counter
+            (logand (length first-packets) #x0f)
+            :payload-unit-start t))
+         (input
+           (append
+            (make-test-pat-packets)
+            (make-test-pmt-packets :two-audio-p nil)
+            (list (make-test-program-pcr-packet 90000))
+            first-packets second-packets)))
+    (check-bridge-test
+     (signals-bridge-error-p
+      (lambda ()
+        (run-packet-processor input :passthrough :opus))))))
+
 (define-bridge-test vp9-opus-processor-end-to-end
   (let* ((pat (make-test-pat-packets))
          (pmt (make-test-pmt-packets))
