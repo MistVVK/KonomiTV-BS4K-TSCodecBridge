@@ -4,7 +4,7 @@ SHELL := /bin/bash
 
 .DEFAULT_GOAL := build
 
-.PHONY: benchmark build check ci clean compile docker-release-check final-release-check fixtures fixtures-check lint release-check runtime-release-audit soak soak-24h soak-600 test test-executable test-ffmpeg-integration test-runtime-image
+.PHONY: benchmark build check clean compile docker-release-check final-release-check fixtures fixtures-check lint release-check runtime-release-audit soak soak-24h soak-600 test test-executable test-ffmpeg-integration test-runtime-image
 
 compile:
 	bash scripts/compile.sh
@@ -59,8 +59,6 @@ soak-24h:
 	SOAK_MODE=av1 SOAK_DURATION_SECONDS=86400 bash scripts/soak.sh
 
 check: compile lint test fixtures-check
-
-ci: check test-executable
 
 clean:
 	rm -f build/ts-codec-bridge.elf
