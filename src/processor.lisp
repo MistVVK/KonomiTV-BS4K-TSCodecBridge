@@ -22,6 +22,12 @@
 ;; 1ms (90 ticks) 以内は実害のない丸めジッターとして rebase し、大きな飛びだけを致命とする。
 (defconstant +opus-pts-jitter-tolerance-ticks+ 90)
 (defconstant +repacketize-deadline-milliseconds+ 2)
+;; FFmpeg の MPEG-TS muxer は 1 AU の映像 PES を連続 packet として出し、
+;; CBR の null packet を AU 間へまとめる。low-overhead OBU から start-code
+;; 形式への変換で増えた数 byte を次の null へ載せるには、2 ms では映像 PES
+;; burst の途中で期限切れになる。KonomiTV が扱う最小 24 fps の 1 frame
+;; (約 41.7 ms) を覆う 50 ms まで保持し、最終的な適合性は T-STD で検証する。
+(defconstant +av1-stream-repacketize-deadline-milliseconds+ 50)
 
 (defstruct pending-entry
   (packet (make-array +ts-packet-size+
@@ -1519,8 +1525,11 @@ PCR付きPUSIを含む映像target packetは移動も分割もしない。先行
    +ts-packet-size+))
 
 (defun repacketize-deadline-slot-from-origin
-    (processor origin-slot)
-  "ORIGIN-SLOTから2ms以内に許される最終slot indexを返す。"
+    (processor origin-slot
+     &optional
+       (deadline-milliseconds
+         +repacketize-deadline-milliseconds+))
+  "ORIGIN-SLOTから指定時間内に許される最終slot indexを返す。"
   (let ((model
           (bridge-processor-tstd-model processor)))
     (if model
@@ -1529,7 +1538,7 @@ PCR付きPUSIを含む映像target packetは移動も分割もしない。先行
             (*
              (tstd-arrival-clock-transport-rate-bps
               (tstd-model-clock model))
-             +repacketize-deadline-milliseconds+)
+             deadline-milliseconds)
             (* 1000 8 +ts-packet-size+)))
         origin-slot)))
 
@@ -1552,7 +1561,8 @@ PCR付きPUSIを含む映像target packetは移動も分割もしない。先行
            :origin-slot origin-slot
            :deadline-slot
            (repacketize-deadline-slot-from-origin
-            processor origin-slot)
+            processor origin-slot
+            +av1-stream-repacketize-deadline-milliseconds+)
            :payload-unit-start-p payload-unit-start-p
            :adaptation-flags
            (if (and
@@ -1583,7 +1593,7 @@ PCR付きPUSIを含む映像target packetは移動も分割もしない。先行
 (defun validate-av1-stream-byte-deadline
     (processor assembler
      &key consume-current-slot-p actual-slot)
-  "AV1 byte FIFO先頭segmentの2ms期限を検証する。"
+  "AV1 byte FIFO先頭segmentのAU間null待機期限を検証する。"
   (let ((segment
           (pes-assembler-av1-stream-byte-head assembler))
         (resolved-slot

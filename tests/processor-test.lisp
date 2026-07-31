@@ -1444,7 +1444,7 @@
       (check-bridge-test
        (= (replacement-provenance-origin-slot provenance) 0))
       (check-bridge-test
-       (= (replacement-provenance-deadline-slot provenance) 2)))))
+       (= (replacement-provenance-deadline-slot provenance) 50)))))
 
 (define-bridge-test strict-stream-reader-handles-partial-reads
   (let* ((vp9-frame

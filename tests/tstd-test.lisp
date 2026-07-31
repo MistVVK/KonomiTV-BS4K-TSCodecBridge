@@ -1813,17 +1813,19 @@
           (%make-pes-assembler +test-video-pid+ :video)))
     (append-av1-stream-byte-segment
      processor assembler (octets #x11) 0)
+    ;; 一般の再配置期限 2 ms を越えても、24 fps の 1 frame を覆う
+    ;; AV1 専用 50 ms 窓内なら AU 間の null packet を待てる。
     (validate-av1-stream-byte-deadline
-     processor assembler :actual-slot 2)
+     processor assembler :actual-slot 50)
     (validate-av1-stream-byte-deadline
      processor assembler
      :consume-current-slot-p t
-     :actual-slot 3)
+     :actual-slot 51)
     (check-bridge-test
      (signals-bridge-error-p
       (lambda ()
         (validate-av1-stream-byte-deadline
-         processor assembler :actual-slot 3))))
+         processor assembler :actual-slot 51))))
     ;; 次PUSI/EOFで旧PESを跨がせず、同じ空検査でfail closedにする。
     (check-bridge-test
      (signals-bridge-error-p
