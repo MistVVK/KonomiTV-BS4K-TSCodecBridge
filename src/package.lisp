@@ -14,6 +14,8 @@
    #:bridge-options
    #:bridge-options-action
    #:bridge-options-audio-codec
+   #:bridge-options-stream-anchor-maximum-distance-ticks
+   #:bridge-options-stream-anchor-v1-p
    #:bridge-options-transport-rate-kbps
    #:bridge-options-video-codec
    #:copy-binary-stream

@@ -75,6 +75,13 @@
   (offset 0 :type fixnum)
   (origin-slot 0 :type (integer 0 *))
   (deadline-slot 0 :type (integer 0 *))
+  (payload-unit-start-p nil :type boolean)
+  (adaptation-flags 0 :type octet)
+  (next nil))
+
+(defstruct av1-stream-target-entry
+  (entry (make-pending-entry) :type pending-entry)
+  (kind :video :type (member :video :null))
   (next nil))
 
 (defstruct (pes-assembler
@@ -104,6 +111,11 @@
   (av1-stream-byte-tail nil
                         :type (or null av1-stream-byte-segment))
   (av1-stream-byte-count 0 :type (integer 0 *))
+  (av1-stream-target-head nil
+                          :type (or null av1-stream-target-entry))
+  (av1-stream-target-tail nil
+                          :type (or null av1-stream-target-entry))
+  (av1-stream-target-count 0 :type (integer 0 *))
   (av1-stream-output-start-p nil :type boolean)
   (av1-stream-last-template nil
                             :type (or null octet-vector))
@@ -1311,6 +1323,19 @@
   "TABLEを現在versionのCRC付きsectionへ変換する。"
   (build-pmt-section (copy-program-map-table-deep table)))
 
+(defun repacketize-holdback-slot-count (processor)
+  "明示CBRで2ms未満となる、未出力保持可能なpacket数を返す。"
+  (let ((model
+          (bridge-processor-tstd-model processor)))
+    (if model
+        (floor
+         (*
+          (tstd-arrival-clock-transport-rate-bps
+           (tstd-model-clock model))
+          +repacketize-deadline-milliseconds+)
+         (* 1000 8 +ts-packet-size+))
+        0)))
+
 (defun synthetic-pmt-before-video (processor event)
   "EVENTのAV1構成をAU直前へ告知するPMT packet列を返す。"
   (let ((table (video-event-source-pmt-table event))
@@ -1328,6 +1353,81 @@
      (video-event-configuration event)
      (ts-continuity-counter template)
      (ts-transport-priority-p template))))
+
+(defun backfill-synthetic-pmt-before-video
+    (processor packets video-start-entry)
+  "VIDEO-START-ENTRY前2ms内の未出力nullへPACKETSを時系列順に置く。
+
+PCR付きPUSIを含む映像target packetは移動も分割もしない。先行nullを
+確保できない場合はPMT-before-PUSIを満たせないためfail closedにする。"
+  (unless packets
+    (return-from backfill-synthetic-pmt-before-video '()))
+  (let* ((origin-slot
+           (pending-entry-slot-index video-start-entry))
+         (holdback-count
+           (repacketize-holdback-slot-count processor))
+         (latest-entry
+           (bridge-processor-pending-tail processor))
+         (latest-slot
+           (and latest-entry
+                (pending-entry-slot-index latest-entry)))
+         (earliest-slot
+           (max
+            0
+            (-
+             (or latest-slot origin-slot)
+             holdback-count)))
+         (candidates '()))
+    (when (or
+           (< holdback-count (length packets))
+           (and latest-slot
+                (> latest-slot
+                   (+
+                    origin-slot
+                    (- holdback-count (length packets))))))
+      (bridge-error
+       "REPACKETIZE_CAPACITY_EXHAUSTED reason=pmt_backfill_information_deadline origin_slot=~D deadline_slot=~D actual_slot=~D"
+       origin-slot
+       (+
+        origin-slot
+        (- holdback-count (length packets)))
+       (or latest-slot origin-slot)))
+    (loop for entry = (bridge-processor-pending-head processor)
+            then (pending-entry-next entry)
+          while entry
+          for slot = (pending-entry-slot-index entry)
+          while (< slot origin-slot)
+          when (and
+                (>= slot earliest-slot)
+                (pending-entry-resolved-p entry)
+                (pending-entry-use-original-p entry)
+                (= (ts-pid (pending-entry-packet entry))
+                   +ts-null-pid+))
+            do (push entry candidates))
+    (setf candidates (nreverse candidates))
+    (when (< (length candidates) (length packets))
+      (bridge-error
+       "REPACKETIZE_CAPACITY_EXHAUSTED reason=pmt_backfill_null_slots origin_slot=~D earliest_slot=~D required_packets=~D available_null_slots=~D"
+       origin-slot
+       earliest-slot
+       (length packets)
+       (length candidates)))
+    (let ((selected
+            (nthcdr
+             (- (length candidates) (length packets))
+             candidates)))
+      (loop for entry in selected
+            for packet in packets
+            do
+        ;; entryはまだallocatorへ渡していないoriginal nullだけに限定する。
+        ;; slot indexは変えず、その固定slotの最終packetだけをPMTへ置換する。
+        (setf
+         (pending-entry-packet entry) packet
+         (pending-entry-resolved-p entry) t
+         (pending-entry-use-original-p entry) t
+         (pending-entry-replacements entry) '()
+         (pending-entry-replacement-provenances entry) '())))
+    packets))
 
 (defun register-av1-tstd-access-unit
     (processor video-pid header configuration semantics
@@ -1355,7 +1455,15 @@
 (defun resolve-video-event (processor event)
   "EVENTのPESをmapping形式へ再構築しentryを解決する。"
   (let* ((entries (video-event-entries event))
-         (first-entry (first entries))
+         (video-start-entry
+           (or
+            (find-if
+             (lambda (entry)
+               (ts-payload-unit-start-p
+                (pending-entry-packet entry)))
+             entries)
+            (bridge-error
+             "Video PES entries have no PUSI packet")))
          (configuration (video-event-configuration event))
          (synthetic-pmt
            (if (and (eq (video-event-codec event) :av1)
@@ -1382,18 +1490,11 @@
         (video-event-frame-semantics event)
         (bridge-error "TSTD_AV1_FRAME_SEMANTICS_MISSING"))
        (video-event-refresh-frame-flags event)))
+    (when synthetic-pmt
+      (backfill-synthetic-pmt-before-video
+       processor synthetic-pmt video-start-entry))
     (resolve-video-packet-entries
      processor entries (video-event-pes event) flags)
-    (when synthetic-pmt
-      (setf (pending-entry-replacements first-entry)
-            (append synthetic-pmt
-                    (pending-entry-replacements first-entry)))
-      (when (pending-entry-replacement-provenances first-entry)
-        (setf
-         (pending-entry-replacement-provenances first-entry)
-         (append
-          (make-list (length synthetic-pmt))
-          (pending-entry-replacement-provenances first-entry)))))
     t))
 
 (defun resolve-head-event-if-possible (processor entry)
@@ -1443,13 +1544,22 @@
   "変換済みOCTETSを入力ORIGIN-SLOT付きFIFO segmentへ追加する。"
   (when (zerop (length octets))
     (return-from append-av1-stream-byte-segment nil))
-  (let ((segment
+  (let* ((payload-unit-start-p
+           (pes-assembler-av1-stream-output-start-p assembler))
+         (segment
           (make-av1-stream-byte-segment
            :octets octets
            :origin-slot origin-slot
            :deadline-slot
            (repacketize-deadline-slot-from-origin
-            processor origin-slot))))
+            processor origin-slot)
+           :payload-unit-start-p payload-unit-start-p
+           :adaptation-flags
+           (if (and
+                payload-unit-start-p
+                (pes-assembler-stream-random-access-kind assembler))
+               #x60
+               0))))
     (if (pes-assembler-av1-stream-byte-tail assembler)
         (setf
          (av1-stream-byte-segment-next
@@ -1464,6 +1574,10 @@
     (incf
      (pes-assembler-av1-stream-byte-count assembler)
      (length octets))
+    (when payload-unit-start-p
+      (setf
+       (pes-assembler-av1-stream-output-start-p assembler)
+       nil))
     segment))
 
 (defun validate-av1-stream-byte-deadline
@@ -1491,7 +1605,7 @@
   assembler)
 
 (defun drain-av1-stream-bytes (assembler maximum-count)
-  "AV1 byte FIFO先頭から最大MAXIMUM-COUNT byteを順に取り出す。"
+  "AV1 byte FIFO先頭からPUSI境界を跨がず最大 byte 数を取り出す。"
   (let ((result
           (make-array maximum-count
                       :element-type 'octet))
@@ -1501,32 +1615,47 @@
                  (pes-assembler-av1-stream-byte-head assembler))
           for segment =
             (pes-assembler-av1-stream-byte-head assembler)
-          for segment-octets =
-            (av1-stream-byte-segment-octets segment)
-          for segment-offset =
-            (av1-stream-byte-segment-offset segment)
-          for count =
-            (min
-             (- maximum-count output-offset)
-             (- (length segment-octets) segment-offset))
           do
-      (replace result segment-octets
-               :start1 output-offset
-               :start2 segment-offset
-               :end2 (+ segment-offset count))
-      (incf output-offset count)
-      (incf (av1-stream-byte-segment-offset segment) count)
-      (decf (pes-assembler-av1-stream-byte-count assembler)
-            count)
-      (when (= (av1-stream-byte-segment-offset segment)
-               (length segment-octets))
-        (setf
-         (pes-assembler-av1-stream-byte-head assembler)
-         (av1-stream-byte-segment-next segment))
-        (unless (pes-assembler-av1-stream-byte-head assembler)
+      ;; PES末尾残留と次PES先頭を同じTS payloadへ混在させない。
+      (when (and
+             (plusp output-offset)
+             (av1-stream-byte-segment-payload-unit-start-p segment))
+        (return))
+      (let* ((segment-octets
+               (av1-stream-byte-segment-octets segment))
+             (segment-offset
+               (av1-stream-byte-segment-offset segment))
+             (count
+               (min
+                (- maximum-count output-offset)
+                (- (length segment-octets) segment-offset))))
+        (replace result segment-octets
+                 :start1 output-offset
+                 :start2 segment-offset
+                 :end2 (+ segment-offset count))
+        (incf output-offset count)
+        (incf (av1-stream-byte-segment-offset segment) count)
+        (decf (pes-assembler-av1-stream-byte-count assembler)
+              count)
+        ;; PUSIはsegmentの最初の出力packetだけに付ける。
+        (when (and
+               (plusp count)
+               (av1-stream-byte-segment-payload-unit-start-p
+                segment))
           (setf
-           (pes-assembler-av1-stream-byte-tail assembler)
-           nil))))
+           (av1-stream-byte-segment-payload-unit-start-p segment)
+           nil
+           (av1-stream-byte-segment-adaptation-flags segment)
+           0))
+        (when (= (av1-stream-byte-segment-offset segment)
+                 (length segment-octets))
+          (setf
+           (pes-assembler-av1-stream-byte-head assembler)
+           (av1-stream-byte-segment-next segment))
+          (unless (pes-assembler-av1-stream-byte-head assembler)
+            (setf
+             (pes-assembler-av1-stream-byte-tail assembler)
+             nil)))))
     (if (= output-offset maximum-count)
         result
         (subseq result 0 output-offset))))
@@ -1550,14 +1679,63 @@
             (pes-assembler-av1-stream-byte-count assembler)))
       assembler)))
 
+(defun enqueue-av1-stream-target-entry
+    (assembler entry &key (kind :video))
+  "未出力AV1 target templateをsource slot順queueへ追加する。"
+  (let ((target
+          (make-av1-stream-target-entry
+           :entry entry :kind kind)))
+    (if (pes-assembler-av1-stream-target-tail assembler)
+        (setf
+         (av1-stream-target-entry-next
+          (pes-assembler-av1-stream-target-tail assembler))
+         target)
+        (setf
+         (pes-assembler-av1-stream-target-head assembler)
+         target))
+    (setf
+     (pes-assembler-av1-stream-target-tail assembler)
+     target)
+    (incf
+     (pes-assembler-av1-stream-target-count assembler))
+    target))
+
+(defun dequeue-av1-stream-target-entry (assembler)
+  "AV1 target template queueの先頭ENTRYを取り出す。"
+  (let ((target
+          (pes-assembler-av1-stream-target-head assembler)))
+    (unless target
+      (return-from dequeue-av1-stream-target-entry nil))
+    (setf
+     (pes-assembler-av1-stream-target-head assembler)
+     (av1-stream-target-entry-next target))
+    (decf
+     (pes-assembler-av1-stream-target-count assembler))
+    (unless (pes-assembler-av1-stream-target-head assembler)
+      (setf
+       (pes-assembler-av1-stream-target-tail assembler)
+       nil))
+    (av1-stream-target-entry-entry target)))
+
 (defun make-av1-stream-null-continuation
     (processor assembler)
   "現在null slotへAV1 FIFO先頭から最大184 byteを配置する。"
-  (let ((template
+  (let* ((template
           (or
            (pes-assembler-av1-stream-last-template assembler)
            (bridge-error
-            "AV1 streaming residual has no video packet template"))))
+            "AV1 streaming residual has no video packet template")))
+         (segment
+           (or
+            (pes-assembler-av1-stream-byte-head assembler)
+            (bridge-error
+             "AV1 streaming continuation has no byte segment")))
+         (payload-unit-start-p
+           (av1-stream-byte-segment-payload-unit-start-p segment))
+         (flags
+           (av1-stream-byte-segment-adaptation-flags segment))
+         (capacity
+           (if (plusp flags) 182 184)))
     (validate-av1-stream-byte-deadline
      processor assembler :consume-current-slot-p t)
     (let* ((pid (pes-assembler-pid assembler))
@@ -1566,10 +1744,15 @@
               processor pid
               (ts-continuity-counter template)))
            (payload
-             (drain-av1-stream-bytes assembler 184))
+             (drain-av1-stream-bytes assembler capacity))
            (packet
-             (make-extra-payload-packet
-              template payload counter)))
+             (make-ts-packet
+              pid counter payload
+              :payload-unit-start payload-unit-start-p
+              :random-access (logbitp 6 flags)
+              :elementary-stream-priority (logbitp 5 flags)
+              :transport-priority
+              (ts-transport-priority-p template))))
       (record-output-payload-count processor pid counter 1)
       packet)))
 
@@ -1592,6 +1775,9 @@
   (when (ts-pcr packet)
     (bridge-error
      "REPACKETIZE_PCR_CANNOT_USE_RECLAIMED_SLOT"))
+  (when (ts-discontinuity-indicator-p packet)
+    (bridge-error
+     "REPACKETIZE_DISCONTINUITY_CANNOT_USE_RECLAIMED_SLOT"))
   (let ((entry
           (make-output-packet-entry
            :packet packet
@@ -1650,15 +1836,53 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
                (output-packet-entry-deadline-slot entry)
                (if consume-current-slot-p 1 0))))
       (if (output-packet-entry-origin-slot entry)
+          (let* ((model
+                   (bridge-processor-tstd-model processor))
+                 (packet-index
+                   (and model
+                        (tstd-model-packet-index model))))
+            (bridge-error
+             "REPACKETIZE_CAPACITY_EXHAUSTED origin_slot=~D deadline_slot=~D actual_slot=~D pid=0x~4,'0X pusi=~A pcr=~A discontinuity=~A pending_packets=~D tstd_overflow=~A tb_fullness=~A tb_rate=~A tb_last_arrival=~A tb_service_end=~A tstd_packet_index=~A"
+             (output-packet-entry-origin-slot entry)
+             (output-packet-entry-deadline-slot entry)
+             (bridge-processor-output-slot-index processor)
+             (ts-pid (output-packet-entry-packet entry))
+             (ts-payload-unit-start-p
+              (output-packet-entry-packet entry))
+             (not
+              (null
+               (ts-pcr (output-packet-entry-packet entry))))
+             (ts-discontinuity-indicator-p
+              (output-packet-entry-packet entry))
+             (bridge-processor-output-packet-count processor)
+             (output-packet-would-overflow-tstd-p
+              processor
+              (output-packet-entry-packet entry))
+             (and model
+                  (tstd-model-transport-buffer-fullness model))
+             (and model
+                  (tstd-model-rx-bytes-per-second model))
+             (and model
+                  (tstd-model-transport-buffer-last-arrival model))
+             (and model
+                  (tstd-model-transport-buffer-service-end model))
+             packet-index))
           (bridge-error
-           "REPACKETIZE_CAPACITY_EXHAUSTED origin_slot=~D deadline_slot=~D actual_slot=~D"
-           (output-packet-entry-origin-slot entry)
+           "REPACKETIZE_CAPACITY_EXHAUSTED deadline_slot=~D actual_slot=~D pid=0x~4,'0X pusi=~A pcr=~A discontinuity=~A pending_packets=~D tstd_overflow=~A"
            (output-packet-entry-deadline-slot entry)
-           (bridge-processor-output-slot-index processor))
-          (bridge-error
-           "REPACKETIZE_CAPACITY_EXHAUSTED deadline_slot=~D actual_slot=~D"
-           (output-packet-entry-deadline-slot entry)
-           (bridge-processor-output-slot-index processor)))))
+           (bridge-processor-output-slot-index processor)
+           (ts-pid (output-packet-entry-packet entry))
+           (ts-payload-unit-start-p
+            (output-packet-entry-packet entry))
+           (not
+            (null
+             (ts-pcr (output-packet-entry-packet entry))))
+           (ts-discontinuity-indicator-p
+            (output-packet-entry-packet entry))
+           (bridge-processor-output-packet-count processor)
+           (output-packet-would-overflow-tstd-p
+            processor
+            (output-packet-entry-packet entry))))))
   processor)
 
 (defun finish-output-packet-allocation (processor)
@@ -1676,6 +1900,32 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
    (make-array 184
                :element-type 'octet
                :initial-element #xff)))
+
+(defun output-packet-would-overflow-tstd-p
+    (processor packet)
+  "現在slotへPACKETを置くとAV1映像TBがoverflowするか返す。"
+  (let ((model
+          (bridge-processor-tstd-model processor)))
+    (and
+     model
+     (tstd-output-video-packet-would-overflow-p
+      model packet))))
+
+(defun av1-stream-continuation-would-overflow-tstd-p
+    (processor assembler)
+  "現在slotへAV1 byte FIFO continuationを置くとTB overflowするか返す。"
+  (let ((model
+          (bridge-processor-tstd-model processor))
+        (segment
+          (pes-assembler-av1-stream-byte-head assembler)))
+    (and
+     model
+     segment
+     (tstd-video-packet-would-overflow-p
+      model
+      :payload-unit-start-p
+      (av1-stream-byte-segment-payload-unit-start-p
+       segment)))))
 
 (defun allocate-output-entry (processor entry)
   "非対象/PCR slotを固定しextraはnull/reclaimed slotだけへ割り当てる。"
@@ -1705,6 +1955,11 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
            (and
             av1-assembler
             original-null-p
+            (<=
+             (av1-stream-byte-segment-origin-slot
+              (pes-assembler-av1-stream-byte-head
+               av1-assembler))
+             (pending-entry-slot-index entry))
             (pending-entry-use-original-p entry)
             (null
              (bridge-processor-output-packet-head processor))))
@@ -1728,19 +1983,44 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
        processor av1-assembler))
     (cond
       ((pending-entry-use-original-p entry)
-       (validate-repacketize-deadline
-        processor
-        :consume-current-slot-p original-null-p)
-       (if original-null-p
-           (setf output
-                 (or
-                  (dequeue-output-packet processor)
-                  (and
-                   av1-assembler
-                   (make-av1-stream-null-continuation
-                    processor av1-assembler))
-                  original))
-           (setf output original)))
+       (cond
+         (original-null-p
+          (let ((queued
+                  (bridge-processor-output-packet-head
+                   processor)))
+            (cond
+              (queued
+               (cond
+                 ((output-packet-would-overflow-tstd-p
+                   processor
+                   (output-packet-entry-packet queued))
+                  ;; 現slotはnullのまま残し、映像packetは次の
+                  ;; 安全なreclaimed slotまでFIFO先頭で待たせる。
+                  (validate-repacketize-deadline processor)
+                  (setf output original))
+                 (t
+                  (validate-repacketize-deadline
+                   processor :consume-current-slot-p t)
+                  (setf
+                   output
+                   (dequeue-output-packet processor)))))
+              ((and
+                av1-assembler
+                (av1-stream-continuation-would-overflow-tstd-p
+                 processor av1-assembler))
+               (validate-av1-stream-byte-deadline
+                processor av1-assembler)
+               (setf output original))
+              (av1-assembler
+               (setf
+                output
+                (make-av1-stream-null-continuation
+                 processor av1-assembler)))
+              (t
+               (setf output original)))))
+         (t
+          (validate-repacketize-deadline processor)
+          (setf output original))))
       (original-pcr
        (validate-repacketize-deadline processor)
        (when (bridge-processor-output-packet-head processor)
@@ -1765,31 +2045,67 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
       (replacements
        (cond
          ((bridge-processor-output-packet-head processor)
-          (validate-repacketize-deadline
-           processor :consume-current-slot-p t)
-          ;; 先行extraを現在の変換対象slotへ置き、現在slotの
-          ;; replacementを次の対象/null slotへ送る。各payloadは
-          ;; 自身の入力slotから2ms以内のままcodec byte順を保つ。
-          (setf
-           output (dequeue-output-packet processor)
-           extras replacements
-           extra-provenances replacement-provenances))
+          (let* ((queued
+                   (bridge-processor-output-packet-head
+                    processor))
+                 (candidate
+                   (output-packet-entry-packet queued)))
+            (cond
+              ((output-packet-would-overflow-tstd-p
+                processor candidate)
+               (validate-repacketize-deadline processor)
+               (setf output (make-output-null-packet)))
+              (t
+               (validate-repacketize-deadline
+                processor :consume-current-slot-p t)
+               ;; 先行extraを現在の変換対象slotへ置き、現在slotの
+               ;; replacementを次の対象/null slotへ送る。
+               (setf
+                output
+                (dequeue-output-packet processor))))
+            (setf
+             extras replacements
+             extra-provenances replacement-provenances)))
          (t
-          (setf
-           output (first replacements)
-           extras (rest replacements)
-           extra-provenances
-           (rest replacement-provenances)))))
+          (let ((candidate (first replacements)))
+            (if
+                (and
+                 (not (ts-pcr candidate))
+                 (output-packet-would-overflow-tstd-p
+                  processor candidate))
+                ;; 映像burstの超過slotをnullへreclaimし、候補自身も
+                ;; 2ms期限付きFIFOへ送る。T-STD検証値は変更しない。
+                (setf
+                 output (make-output-null-packet)
+                 extras replacements
+                 extra-provenances replacement-provenances)
+                (setf
+                 output candidate
+                 extras (rest replacements)
+                 extra-provenances
+                 (rest replacement-provenances)))))))
       (t
        ;; 同一変換groupで空いたtarget slotは既存容量なので、
        ;; mux-rate未確定でも直前extraをここへ戻せる。
-       (validate-repacketize-deadline
-        processor :consume-current-slot-p t)
-       (setf
-        output
-        (or
-         (dequeue-output-packet processor)
-         (make-output-null-packet)))))
+       (let ((queued
+               (bridge-processor-output-packet-head
+                processor)))
+         (cond
+           ((and
+             queued
+             (output-packet-would-overflow-tstd-p
+              processor
+              (output-packet-entry-packet queued)))
+            (validate-repacketize-deadline processor)
+            (setf output (make-output-null-packet)))
+           (queued
+            (validate-repacketize-deadline
+             processor :consume-current-slot-p t)
+           (setf
+             output
+             (dequeue-output-packet processor)))
+           (t
+            (setf output (make-output-null-packet)))))))
     (loop for packet in extras
           for index from 0
           for provenance =
@@ -1815,14 +2131,56 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
     (incf (bridge-processor-output-slot-index processor))
     output))
 
-(defun flush-resolved-entries (processor)
-  "PROCESSORのqueue先頭から解決済みentryを順番に出力する。"
+(defun pending-head-outside-holdback-p (processor)
+  "queue先頭がPMT backfill用2ms窓より古ければ真を返す。"
+  (let ((head
+          (bridge-processor-pending-head processor))
+        (tail
+          (bridge-processor-pending-tail processor))
+        (holdback-count
+          (repacketize-holdback-slot-count processor)))
+    (when (or (null head) (zerop holdback-count))
+      (return-from pending-head-outside-holdback-p t))
+    (>=
+     (-
+      (pending-entry-slot-index tail)
+      (pending-entry-slot-index head))
+     holdback-count)))
+
+(defun resolve-oldest-ready-event-lookahead (processor)
+  "先行resolved entryを越え、最古unresolved eventだけを先読み解決する。"
+  (loop for entry = (bridge-processor-pending-head processor)
+          then (pending-entry-next entry)
+        while entry
+        unless (pending-entry-resolved-p entry)
+          do
+             ;; eventを持たないunresolved targetは意味確定待ちなので、
+             ;; それを飛び越えて後続eventを時系列逆順に解決しない。
+             (return
+               (and
+                (pending-entry-event entry)
+                (resolve-head-event-if-possible
+                 processor entry)))
+        finally (return nil)))
+
+(defun flush-resolved-entries (processor &key force-p)
+  "PROCESSORのqueue先頭から解決済みentryを順番に出力する。
+
+通常は初回AV1構成のPMTを先行nullへ置けるよう、明示CBRの2ms分を
+未出力で保持する。FORCE-PならEOFで保持分もすべて出力する。"
+  (loop while
+        (resolve-oldest-ready-event-lookahead processor))
   (loop
     for entry = (bridge-processor-pending-head processor)
     while entry
     do (unless (pending-entry-resolved-p entry)
          (unless (resolve-head-event-if-possible processor entry)
            (return)))
+       (when (and
+              (not force-p)
+              (not
+               (pending-head-outside-holdback-p processor)))
+         (return))
        (allocate-output-entry processor entry)
        (setf (bridge-processor-pending-head processor)
              (pending-entry-next entry))
@@ -2151,7 +2509,7 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
       (t nil))))
 
 (defun clear-pes-event-state (assembler)
-  "ASSEMBLERの完了済みPES eventだけを初期化する。"
+  "ASSEMBLERの完了済みPES eventとAV1残留を初期化する。"
   (setf (pes-assembler-active-p assembler) nil
         (pes-assembler-entries assembler) '()
         (fill-pointer (pes-assembler-buffer assembler)) 0
@@ -2166,11 +2524,6 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
          assembler)
         nil
         (pes-assembler-av1-stream-transformer assembler) nil
-        (pes-assembler-av1-stream-byte-head assembler) nil
-        (pes-assembler-av1-stream-byte-tail assembler) nil
-        (pes-assembler-av1-stream-byte-count assembler) 0
-        (pes-assembler-av1-stream-output-start-p assembler) nil
-        (pes-assembler-av1-stream-last-template assembler) nil
         (pes-assembler-source-pmt-table assembler) nil
         (pes-assembler-source-pmt-pid assembler) nil
         (pes-assembler-source-pmt-template assembler) nil
@@ -2181,6 +2534,15 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
          assembler)
         nil
         (pes-assembler-program-timestamp-recorded-p assembler) nil)
+  (setf
+   (pes-assembler-av1-stream-byte-head assembler) nil
+   (pes-assembler-av1-stream-byte-tail assembler) nil
+   (pes-assembler-av1-stream-byte-count assembler) 0
+   (pes-assembler-av1-stream-target-head assembler) nil
+   (pes-assembler-av1-stream-target-tail assembler) nil
+   (pes-assembler-av1-stream-target-count assembler) 0
+   (pes-assembler-av1-stream-output-start-p assembler) nil
+   (pes-assembler-av1-stream-last-template assembler) nil)
   assembler)
 
 (defun start-pes-event (processor assembler)
@@ -2442,13 +2804,17 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
     (setf
      (pes-assembler-av1-stream-last-template assembler)
      packet))
-  (let* ((start-p
-           (pes-assembler-av1-stream-output-start-p assembler))
+  (let* ((head-segment
+           (pes-assembler-av1-stream-byte-head assembler))
+         (start-p
+           (and
+            head-segment
+            (av1-stream-byte-segment-payload-unit-start-p
+             head-segment)))
          (flags
-           (if (and
-                start-p
-                (pes-assembler-stream-random-access-kind assembler))
-               #x60
+           (if head-segment
+               (av1-stream-byte-segment-adaptation-flags
+                head-segment)
                0))
          (capacity
            (if (ts-has-payload-p packet)
@@ -2497,10 +2863,7 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
          (record-output-payload-count
           processor
           (pes-assembler-pid assembler)
-          counter 1)
-         (setf
-          (pes-assembler-av1-stream-output-start-p assembler)
-          nil))
+          counter 1))
         (t
          (let ((adaptation-only
                  (make-adaptation-only-from-template
@@ -2513,6 +2876,146 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
                  (list adaptation-only)
                  '())))))))
   entry)
+
+(defun resolve-av1-stream-byte-null-target-entry
+    (processor assembler entry)
+  "保持中null targetへAV1 byteを最大1 packet分だけ時系列配置する。"
+  (let* ((segment
+           (pes-assembler-av1-stream-byte-head assembler))
+         (start-p
+           (and
+            segment
+            (av1-stream-byte-segment-payload-unit-start-p
+             segment)))
+         (flags
+           (if segment
+               (av1-stream-byte-segment-adaptation-flags segment)
+               0))
+         (capacity
+           (if (plusp flags) 182 184)))
+    (if (and
+         segment
+         (plusp
+          (pes-assembler-av1-stream-byte-count assembler)))
+        (let* ((template
+                 (or
+                  (pes-assembler-av1-stream-last-template assembler)
+                  (bridge-error
+                   "AV1 streaming null target has no video template")))
+               (pid
+                 (pes-assembler-pid assembler))
+               (fallback
+                 (ts-continuity-counter template))
+               (counter
+                 (output-continuity-counter
+                  processor pid fallback))
+               (provenance
+                 (make-replacement-provenance
+                  :origin-slot
+                  (av1-stream-byte-segment-origin-slot segment)
+                  :deadline-slot
+                  (av1-stream-byte-segment-deadline-slot segment))))
+          (validate-av1-stream-byte-deadline
+           processor assembler
+           :consume-current-slot-p t
+           :actual-slot
+           (pending-entry-slot-index entry))
+          (let ((payload
+                  (drain-av1-stream-bytes assembler capacity)))
+            (resolve-entry
+             entry
+             (list
+              (make-ts-packet
+               pid counter payload
+               :payload-unit-start start-p
+               :random-access (logbitp 6 flags)
+               :elementary-stream-priority
+               (logbitp 5 flags)
+               :transport-priority
+               (ts-transport-priority-p template))))
+            (setf
+             (pending-entry-replacement-provenances entry)
+             (list provenance))
+            (record-output-payload-count
+             processor pid counter 1)))
+        (resolve-entry-as-original entry)))
+  entry)
+
+(defun av1-stream-target-payload-capacity (assembler target)
+  "現在FIFO先頭flagを保持したTARGETのpayload容量を返す。"
+  (let ((packet
+          (pending-entry-packet
+           (av1-stream-target-entry-entry target)))
+        (segment
+          (pes-assembler-av1-stream-byte-head assembler)))
+    (ecase (av1-stream-target-entry-kind target)
+      (:video
+       (if (ts-has-payload-p packet)
+           (template-payload-capacity
+            packet
+            (if segment
+                (av1-stream-byte-segment-adaptation-flags segment)
+                0))
+           0))
+      (:null
+       (if (and
+            segment
+            (plusp
+             (av1-stream-byte-segment-adaptation-flags
+              segment)))
+           182
+           184)))))
+
+(defun resolve-ready-av1-stream-target-entries
+    (processor assembler &key force-p current-slot)
+  "2ms未出力窓内でAV1 byteをtarget templateへ時系列順に再充填する。
+
+容量を満たすまでtargetを未解決で保持し、後続source chunkのbyteで
+先行targetのstuffingを減らす。2ms窓を越える時とPUSI/EOFでは部分量でも
+確定し、既にallocatorへ渡したslotは変更しない。"
+  (let ((resolved-count 0)
+        (resolved-slot
+          (or
+           current-slot
+           (let ((tail
+                   (bridge-processor-pending-tail processor)))
+             (and tail
+                  (pending-entry-slot-index tail)))
+           (bridge-processor-output-slot-index processor)))
+        (holdback-count
+          (repacketize-holdback-slot-count processor)))
+    (loop
+      for target =
+        (pes-assembler-av1-stream-target-head assembler)
+      while target
+      for entry = (av1-stream-target-entry-entry target)
+      for capacity =
+        (av1-stream-target-payload-capacity assembler target)
+      for available =
+        (pes-assembler-av1-stream-byte-count assembler)
+      for expired-p =
+        (>=
+         (- resolved-slot
+            (pending-entry-slot-index entry))
+         holdback-count)
+      do
+        (unless (or
+                 force-p
+                 (zerop capacity)
+                 (>= available capacity)
+                 expired-p)
+          (return))
+        (ecase (av1-stream-target-entry-kind target)
+          (:video
+           (resolve-av1-stream-byte-target-entry
+            processor assembler entry
+            (pending-entry-packet entry)))
+          (:null
+           (resolve-av1-stream-byte-null-target-entry
+            processor assembler entry)))
+        (dequeue-av1-stream-target-entry assembler)
+        (incf resolved-count))
+    resolved-count))
 
 (defun rewritten-av1-pes-header-slice
     (packet start end pes-offset)
@@ -2574,39 +3077,63 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
     (append-av1-stream-byte-segment
      processor assembler output
      (pending-entry-slot-index entry))
-    (resolve-av1-stream-byte-target-entry
-     processor assembler entry packet)
     next-pes-offset))
+
+(defun enqueue-initial-av1-stream-target-entries
+    (assembler entries)
+  "初回AV1範囲のvideo templateと介在nullをslot順queueへ追加する。"
+  (let ((first-entry (first entries))
+        (last-entry (car (last entries))))
+    (loop for cursor = first-entry then (pending-entry-next cursor)
+          while cursor
+          do
+      (cond
+        ((member cursor entries :test #'eq)
+         (enqueue-av1-stream-target-entry
+          assembler cursor :kind :video))
+        ((and
+          (pending-entry-resolved-p cursor)
+          (pending-entry-use-original-p cursor)
+          (= (ts-pid (pending-entry-packet cursor))
+             +ts-null-pid+))
+         (mark-entry-unresolved cursor)
+         (enqueue-av1-stream-target-entry
+          assembler cursor :kind :null)))
+      (when (eq cursor last-entry)
+        (return))))
+  assembler)
 
 (defun resolve-initial-av1-stream-entries
     (processor assembler entries transformer payload-offset
      synthetic-pmt)
   "初回prefixを含む蓄積ENTRIESをsource slot順で解決し出力する。"
   (let ((pes-offset 0)
-        (first-p t))
+        (video-start-entry
+          (or
+           (find-if
+            (lambda (entry)
+              (ts-payload-unit-start-p
+               (pending-entry-packet entry)))
+            entries)
+           (bridge-error
+            "Streaming AV1 entries have no PUSI packet"))))
+    (when synthetic-pmt
+      (backfill-synthetic-pmt-before-video
+       processor synthetic-pmt video-start-entry))
     (dolist (entry entries)
       (setf pes-offset
             (transform-initial-av1-entry
              processor assembler entry transformer
-             pes-offset payload-offset))
-      ;; 初回PMTは最初の映像replacementより先に確定してからflushする。
-      (when first-p
-        (when synthetic-pmt
-          (setf (pending-entry-replacements entry)
-                (append
-                 synthetic-pmt
-                 (pending-entry-replacements entry)))
-          (when (pending-entry-replacement-provenances entry)
-            (setf
-             (pending-entry-replacement-provenances entry)
-             (append
-              (make-list (length synthetic-pmt))
-              (pending-entry-replacement-provenances entry)))))
-        (setf first-p nil))
-      ;; 次の映像source packetを変換する前に、その間のnull/non-target
-      ;; slotを現在時点のFIFO状態で処理する。
-      (flush-resolved-entries processor)))
-  entries)
+             pes-offset payload-offset)))
+    (enqueue-initial-av1-stream-target-entries
+     assembler entries)
+    ;; prefix判明までに保持した全source chunkを先に変換し、未出力target
+    ;; templateへslot順で詰める。これによりentry境界ごとのstuffingを
+    ;; 後続byteで再利用できる。
+    (resolve-ready-av1-stream-target-entries
+     processor assembler)
+    (flush-resolved-entries processor)
+    entries))
 
 (defun try-start-av1-streaming (processor assembler)
   "長さ0 AV1 PESをOBU状態機械で次PUSI前に逐次出力する。"
@@ -2690,18 +3217,18 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
            sequence-header-in-access-unit-p
            (pes-assembler-av1-stream-transformer assembler)
            transformer
-           (pes-assembler-av1-stream-byte-head assembler) nil
-           (pes-assembler-av1-stream-byte-tail assembler) nil
-           (pes-assembler-av1-stream-byte-count assembler) 0
-           (pes-assembler-av1-stream-output-start-p assembler) t
-           (pes-assembler-av1-stream-last-template assembler) nil)
+           (pes-assembler-av1-stream-output-start-p assembler) t)
           (register-av1-tstd-access-unit
            processor
            (pes-assembler-pid assembler)
            header
            configuration
            frame-semantics)
-          (flush-resolved-entries processor)
+          ;; PMT eventの意味だけを先に確定する。ここで固定slotをallocate
+          ;; すると、tailからちょうどH slot前のnullがbackfill直前に
+          ;; 出力されてしまうため、synthetic PMT配置後までflushしない。
+          (loop while
+                (resolve-oldest-ready-event-lookahead processor))
           (let* ((event
                    (make-streaming-av1-video-event
                     assembler entries configuration
@@ -2796,12 +3323,15 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
        processor assembler
        (transform-av1-stream-chunk
         (pes-assembler-av1-stream-transformer assembler)
-        packet
-        :start payload-offset
-        :end +ts-packet-size+)
+       packet
+       :start payload-offset
+       :end +ts-packet-size+)
        (pending-entry-slot-index entry)))
-    (resolve-av1-stream-byte-target-entry
-     processor assembler entry packet)))
+    (enqueue-av1-stream-target-entry assembler entry)
+    (resolve-ready-av1-stream-target-entries
+     processor assembler
+     :current-slot
+     (pending-entry-slot-index entry))))
 
 (defun resolve-active-streaming-video-entry
     (processor assembler entry packet)
@@ -2813,6 +3343,51 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
     (:av1
      (resolve-streaming-av1-entry
       processor assembler entry packet))))
+
+(defun resolve-expired-active-av1-targets (processor)
+  "非映像slot進行でも2ms窓を越えるAV1 targetを確定する。"
+  (let* ((pid
+           (bridge-processor-current-video-pid processor))
+         (assembler
+           (and
+            pid
+            (gethash
+             pid
+             (bridge-processor-pes-assemblers processor))))
+         (tail
+           (bridge-processor-pending-tail processor)))
+    (when (and
+           assembler
+           tail
+           (pes-assembler-streaming-p assembler)
+           (pes-assembler-av1-stream-target-head assembler))
+      (resolve-ready-av1-stream-target-entries
+       processor assembler
+       :current-slot
+       (pending-entry-slot-index tail)))))
+
+(defun maybe-enqueue-active-av1-null-target
+    (processor entry packet)
+  "AV1 PES中のnullを未出力byte再充填用targetとして保持する。"
+  (unless (= (ts-pid packet) +ts-null-pid+)
+    (return-from maybe-enqueue-active-av1-null-target nil))
+  (let* ((pid
+           (bridge-processor-current-video-pid processor))
+         (assembler
+           (and
+            pid
+            (gethash
+             pid
+             (bridge-processor-pes-assemblers processor)))))
+    (when (and
+           assembler
+           (pes-assembler-active-p assembler)
+           (pes-assembler-streaming-p assembler)
+           (eq (bridge-processor-video-codec processor) :av1))
+      (mark-entry-unresolved entry)
+      (enqueue-av1-stream-target-entry
+       assembler entry :kind :null)
+      t)))
 
 (defun validate-streamed-vp9-pes (processor pes entries)
   "既に出力したVP9 PES全体を境界で検証する。失敗時は巻き戻さない。"
@@ -2871,6 +3446,12 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
       (bridge-error "Video PES does not carry a PTS"))
     (finish-av1-stream-transformer
      (pes-assembler-av1-stream-transformer assembler))
+    (resolve-ready-av1-stream-target-entries
+     processor assembler :force-p t)
+    (when (pes-assembler-av1-stream-target-head assembler)
+      (bridge-error
+       "INTERNAL_AV1_STREAM_TARGET_QUEUE_NOT_DRAINED count=~D"
+       (pes-assembler-av1-stream-target-count assembler)))
     (finish-av1-stream-byte-fifo assembler)
     (when sequence-header
       (multiple-value-bind (parsed width height)
@@ -3266,6 +3847,9 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
            (when assembler
              (process-target-pes-packet
               processor assembler entry packet)))))
+      (maybe-enqueue-active-av1-null-target
+       processor entry packet)
+      (resolve-expired-active-av1-targets processor)
       (flush-resolved-entries processor)))
   nil)
 
@@ -3310,7 +3894,7 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
   (when (and (eq (bridge-processor-video-codec processor) :av1)
              (not (bridge-processor-seen-video-pes-p processor)))
     (bridge-error "EOF occurs before the initial AV1 access unit"))
-  (flush-resolved-entries processor)
+  (flush-resolved-entries processor :force-p t)
   (when (bridge-processor-pending-head processor)
     (bridge-error "EOF leaves unresolved semantic transport packets"))
   (finish-output-packet-allocation processor)

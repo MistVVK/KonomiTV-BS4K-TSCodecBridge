@@ -36,7 +36,12 @@
          :program-number
          (bridge-options-program-number options)
          :transport-rate-kbps
-         (bridge-options-transport-rate-kbps options))
+         (bridge-options-transport-rate-kbps options)
+         :stream-anchor-v1-p
+         (bridge-options-stream-anchor-v1-p options)
+         :stream-anchor-maximum-distance-ticks
+         (bridge-options-stream-anchor-maximum-distance-ticks
+          options))
         (validate-and-copy-ts-stream input output))))
 
 (defun main (&optional (arguments (rest sb-ext:*posix-argv*)))

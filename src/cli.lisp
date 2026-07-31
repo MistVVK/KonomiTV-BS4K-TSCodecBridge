@@ -14,7 +14,11 @@
   (audio-codec :aac
                :type (member :aac :opus))
   (program-number nil :type (or null (integer 1 65535)))
-  (transport-rate-kbps nil :type (or null (integer 1 *))))
+  (transport-rate-kbps nil :type (or null (integer 1 *)))
+  (stream-anchor-v1-p nil :type boolean)
+  (stream-anchor-maximum-distance-ticks
+    +stream-anchor-default-maximum-distance-ticks+
+    :type (integer 0 *)))
 
 (defun parse-video-codec (value)
   "VALUEを映像codec keywordへ変換する。"
@@ -63,6 +67,23 @@
        "Invalid transport rate in kbit/s: ~A"
        value))))
 
+(defun parse-stream-anchor-distance-ticks (value)
+  "VALUEをStream Anchorの非負最大対応距離へ変換する。"
+  (handler-case
+      (multiple-value-bind (number end)
+          (parse-integer value :junk-allowed t)
+        (unless (and number
+                     (= end (length value))
+                     (not (minusp number)))
+          (bridge-error
+           "Invalid Stream Anchor distance in ticks: ~A"
+           value))
+        number)
+    (parse-error ()
+      (bridge-error
+       "Invalid Stream Anchor distance in ticks: ~A"
+       value))))
+
 (defun parse-command-line (arguments)
   "ARGUMENTSを検証し、BRIDGE-OPTIONSを返す。"
   (let ((mapping-version-count
@@ -89,10 +110,15 @@
            (audio-codec :aac)
            (program-number nil)
            (transport-rate-kbps nil)
+           (stream-anchor-v1-p nil)
+           (stream-anchor-maximum-distance-ticks
+             +stream-anchor-default-maximum-distance-ticks+)
            (seen-video-p nil)
            (seen-audio-p nil)
            (seen-program-p nil)
-           (seen-transport-rate-p nil))
+           (seen-transport-rate-p nil)
+           (seen-stream-anchor-p nil)
+           (seen-stream-anchor-distance-p nil))
        (loop while remaining
              for option = (pop remaining)
              do (cond
@@ -134,6 +160,26 @@
                     transport-rate-kbps
                     (parse-transport-rate-kbps (pop remaining))
                     seen-transport-rate-p t))
+                  ((string= option "--stream-anchor-v1")
+                   (when seen-stream-anchor-p
+                     (bridge-error
+                      "--stream-anchor-v1 may be specified only once"))
+                   (setf stream-anchor-v1-p t
+                         seen-stream-anchor-p t))
+                  ((string=
+                    option
+                    "--stream-anchor-max-distance-ticks")
+                   (when seen-stream-anchor-distance-p
+                     (bridge-error
+                      "--stream-anchor-max-distance-ticks may be specified only once"))
+                   (unless remaining
+                     (bridge-error
+                      "--stream-anchor-max-distance-ticks requires a value"))
+                   (setf
+                    stream-anchor-maximum-distance-ticks
+                    (parse-stream-anchor-distance-ticks
+                     (pop remaining))
+                    seen-stream-anchor-distance-p t))
                   (t
                    (bridge-error "Unknown command-line argument: ~A"
                                  option))))
@@ -145,18 +191,26 @@
          (transport-rate-kbps
           (bridge-error
            "--transport-rate-kbps is only valid with --video-codec av1")))
+       (when (and seen-stream-anchor-distance-p
+                  (not stream-anchor-v1-p))
+         (bridge-error
+          "--stream-anchor-max-distance-ticks requires --stream-anchor-v1"))
        (make-bridge-options
         :action :process
         :video-codec video-codec
         :audio-codec audio-codec
         :program-number program-number
-        :transport-rate-kbps transport-rate-kbps)))))
+        :transport-rate-kbps transport-rate-kbps
+        :stream-anchor-v1-p stream-anchor-v1-p
+        :stream-anchor-maximum-distance-ticks
+        stream-anchor-maximum-distance-ticks)))))
 
 (defun advanced-codec-selection-p (options)
   "OPTIONSがsemantic TS処理を必要とするかを返す。"
   (or (not (eq (bridge-options-video-codec options)
                :passthrough))
-      (eq (bridge-options-audio-codec options) :opus)))
+      (eq (bridge-options-audio-codec options) :opus)
+      (bridge-options-stream-anchor-v1-p options)))
 
 (defun %print-help (stream)
   "STREAMへCLIの英語helpを出力する。"
@@ -168,6 +222,8 @@
              --audio-codec aac|opus             Audio mapping (default: aac)~%~
              --program-number 1..65535           Select one program in a multi-program TS~%~
              --transport-rate-kbps RATE           Required positive CBR kbit/s for AV1 only~%~
+             --stream-anchor-v1                   Finalize Stream Anchor v1 timed ID3 metadata~%~
+             --stream-anchor-max-distance-ticks N Maximum nearest-AU distance (default: 4500)~%~
              AV1 input contract: FFmpeg 8.1.2/libaom realtime, base-layer OBU subset.~%~
              AV1 output targets the pinned 2026-03-25 AOM MPEG-2 TS draft;~%~
              input acceptance is the subset documented in spec/av1-mpeg2-ts-working-draft.md.~%~

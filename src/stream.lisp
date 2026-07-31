@@ -100,18 +100,34 @@
 
 (defun process-ts-stream
     (input output video-codec audio-codec
-     &key program-number transport-rate-kbps)
+     &key program-number transport-rate-kbps
+       stream-anchor-v1-p
+       (stream-anchor-maximum-distance-ticks
+         +stream-anchor-default-maximum-distance-ticks+))
   "INPUTを188-byte単位で厳格処理してOUTPUTへ書く。"
-  (let ((buffer
+  (let* ((buffer
            (make-array (+ +stream-buffer-size+
                           (- +ts-packet-size+ 1))
                        :element-type 'octet))
          (packet
            (make-array +ts-packet-size+
                        :element-type 'octet))
+         (anchor-finalizer
+           (when stream-anchor-v1-p
+             (make-stream-anchor-finalizer
+              output
+              :program-number program-number
+              :maximum-distance-ticks
+              stream-anchor-maximum-distance-ticks)))
+         (processor-output
+           (if anchor-finalizer
+               (make-instance
+                'stream-anchor-output-stream
+                :finalizer anchor-finalizer)
+               output))
          (processor
            (make-bridge-processor
-            output video-codec audio-codec
+            processor-output video-codec audio-codec
             :program-number program-number
             :transport-rate-kbps transport-rate-kbps))
          (carry 0))
@@ -141,5 +157,7 @@
       (bridge-error
        "EOF truncates a transport packet: ~D trailing bytes"
        carry))
-    (finish-bridge-processor processor))
+    (finish-bridge-processor processor)
+    (when anchor-finalizer
+      (finish-stream-anchor-output-stream processor-output)))
   nil)

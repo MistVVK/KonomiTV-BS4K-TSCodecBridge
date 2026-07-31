@@ -238,12 +238,15 @@
         collect
         (subseq octets offset (+ offset +ts-packet-size+))))
 
-(defun run-packet-processor (packets video-codec audio-codec)
+(defun run-packet-processor
+    (packets video-codec audio-codec
+     &key (transport-rate-kbps +test-transport-rate-kbps+)
+          (retime-p t))
   "PACKETSをprocessorへ与え、出力packet列を返す。"
   (let* ((source-packets
-           (if (eq video-codec :av1)
+           (if (and (eq video-codec :av1) retime-p)
                (retime-test-pcrs-for-cbr
-                packets +test-transport-rate-kbps+)
+                packets transport-rate-kbps)
                packets))
          (output (make-instance 'octet-collector-stream))
          (processor
@@ -251,7 +254,7 @@
             output video-codec audio-codec
             :transport-rate-kbps
             (when (eq video-codec :av1)
-              +test-transport-rate-kbps+))))
+              transport-rate-kbps))))
     (dolist (packet source-packets)
       (process-bridge-packet processor (copy-seq packet)))
     (finish-bridge-processor processor)
@@ -978,7 +981,9 @@
         when (funcall predicate packet)
           collect index))
 
-(define-bridge-test av1-configuration-change-injects-pmt-before-au
+(defun make-av1-configuration-change-fixture
+    (&key (prior-null-p t) (transport-rate-kbps 1504))
+  "AV1 level変更直前のnull有無を選べる固定PUSI/PCR fixtureを作る。"
   (let* ((first-access-unit (make-test-av1-access-unit 8))
          (second-access-unit (make-test-av1-access-unit 9))
          (first-video
@@ -986,12 +991,13 @@
             (make-pes #xe0 first-access-unit 90000)
             :continuity-counter 1))
          (second-video
-           (packetize-payload
-            +test-video-pid+
+           (packetize-test-video-with-pcr
             (make-pes #xe0 second-access-unit 180000)
             :continuity-counter
             (logand (+ 1 (length first-video)) #x0f)
-            :payload-unit-start t))
+            :discontinuity nil
+            :pcr-lead-ticks
+            +test-tstd-removal-delay-ticks+))
          (intermediate-pcr
            (loop
              for timestamp from 99000 to 171000 by 9000
@@ -1000,19 +1006,40 @@
               timestamp
               :counter
               (logand (length first-video) #x0f))))
-         (input
+         (prefix
            (append
             (make-test-pat-packets)
             (make-test-pmt-packets :two-audio-p nil)
             first-video
-            intermediate-pcr
+            intermediate-pcr))
+         (between
+           (append
+            (when prior-null-p
+              (list (make-output-null-packet)))
             (list
              (make-ts-packet
-              +test-data-pid+ 1 (octets 1 2 3)))
-            second-video
-            (list (make-output-null-packet))))
+              +test-data-pid+ 1 (octets 1 2 3)))))
+         (origin-slot
+           (+ (length prefix) (length between)))
+         (input
+           (retime-test-pcrs-for-cbr
+            (append
+             prefix
+             between
+             second-video
+             (list (make-output-null-packet)))
+            transport-rate-kbps)))
+    (values input origin-slot)))
+
+(define-bridge-test av1-configuration-change-injects-pmt-before-au
+  (multiple-value-bind (input origin-slot)
+      (make-av1-configuration-change-fixture)
+    (let* ((source-pusi (nth origin-slot input))
          (output
-           (run-packet-processor input :av1 :aac))
+           (run-packet-processor
+            input :av1 :aac
+            :transport-rate-kbps 1504
+            :retime-p nil))
          (sections
            (sections-on-pid output +test-pmt-pid+))
          (versions
@@ -1032,17 +1059,96 @@
             output
             (lambda (packet)
               (and (= (ts-pid packet) +test-video-pid+)
-                   (ts-payload-unit-start-p packet))))))
-    (check-bridge-test (equal versions '(8 9)))
-    (check-bridge-test (= (length video-indices) 2))
-    (check-bridge-test (= (length pmt-indices) 2))
-    (check-bridge-test
-     (< (second pmt-indices)
-        (second video-indices)))
-    (check-bridge-test
-     (payload-continuity-valid-p output +test-pmt-pid+))
-    (check-bridge-test
-     (payload-continuity-valid-p output +test-video-pid+))))
+                   (ts-payload-unit-start-p packet)))))
+         (output-pusi (nth origin-slot output)))
+      (check-bridge-test (equal versions '(8 9)))
+      (check-bridge-test (= (length output) (length input)))
+      (check-bridge-test (= (length video-indices) 2))
+      (check-bridge-test (= (length pmt-indices) 2))
+      (check-bridge-test
+       (< (second pmt-indices)
+          (second video-indices)))
+      ;; 合成PMTをexact-2ms境界の先行nullへ置く。
+      (check-bridge-test
+       (= (second pmt-indices) (- origin-slot 2)))
+      ;; 介在する固定data packetもslot/byteを変えない。
+      (check-bridge-test
+       (equalp
+        (nth (- origin-slot 1) output)
+        (nth (- origin-slot 1) input)))
+      ;; 合成PMTを先行nullへbackfillしても、PCR付きPUSIは同じslotに残す。
+      (check-bridge-test (= (second video-indices) origin-slot))
+      (check-bridge-test
+       (= (ts-pid output-pusi) (ts-pid source-pusi)))
+      (check-bridge-test
+       (= (ts-continuity-counter output-pusi)
+          (ts-continuity-counter source-pusi)))
+      (check-bridge-test (ts-payload-unit-start-p output-pusi))
+      (check-bridge-test (ts-has-payload-p output-pusi))
+      (check-bridge-test (ts-random-access-indicator-p output-pusi))
+      (check-bridge-test
+       (ts-elementary-stream-priority-indicator-p output-pusi))
+      (check-bridge-test
+       (= (ts-pcr output-pusi) (ts-pcr source-pusi)))
+      (check-bridge-test
+       (equalp
+        (subseq output-pusi 6 12)
+        (subseq source-pusi 6 12)))
+      (check-bridge-test
+       (payload-continuity-valid-p output +test-pmt-pid+))
+      (check-bridge-test
+       (payload-continuity-valid-p output +test-video-pid+)))))
+
+(define-bridge-test av1-configuration-change-without-prior-null-fails-in-place
+  (multiple-value-bind (input origin-slot)
+      (make-av1-configuration-change-fixture :prior-null-p nil)
+    (let* ((source-pusi (nth origin-slot input))
+           (output (make-instance 'octet-collector-stream))
+           (processor
+             (make-bridge-processor
+              output :av1 :aac
+              :transport-rate-kbps
+              1504))
+           (message
+             (handler-case
+                 (progn
+                   (dolist (packet input)
+                     (process-bridge-packet
+                      processor (copy-seq packet)))
+                   nil)
+               (bridge-error (condition)
+                 (bridge-error-message condition))))
+           (pending-pusi
+             (loop for entry =
+                     (bridge-processor-pending-head processor)
+                       then (pending-entry-next entry)
+                   while entry
+                   when (= (pending-entry-slot-index entry)
+                           origin-slot)
+                     return entry)))
+      (check-bridge-test
+       (and message
+            (search
+             "reason=pmt_backfill_null_slots"
+             message :test #'char=)))
+      (check-bridge-test
+       (search
+        (format nil "origin_slot=~D" origin-slot)
+        message :test #'char=))
+      ;; fail closed時もPUSI/PCR packet自体は移動・分割・書換えしない。
+      (check-bridge-test pending-pusi)
+      (check-bridge-test
+       (= (pending-entry-slot-index pending-pusi)
+          origin-slot))
+      (check-bridge-test
+       (equalp (pending-entry-packet pending-pusi)
+               source-pusi))
+      (check-bridge-test
+       (ts-payload-unit-start-p
+        (pending-entry-packet pending-pusi)))
+      (check-bridge-test
+       (= (ts-pcr (pending-entry-packet pending-pusi))
+          (ts-pcr source-pusi))))))
 
 (defun make-av1-initial-interleaved-null-fixture
     (&key trailing-null-p)
@@ -1111,8 +1217,8 @@
   (multiple-value-bind (input expected intermediate-null-index)
       (make-av1-initial-interleaved-null-fixture
        :trailing-null-p t)
-    (declare (ignore intermediate-null-index))
-    (let* ((output
+    (let* ((trailing-null (car (last input)))
+           (output
              (run-packet-processor input :av1 :aac))
            (rebuilt
              (first-unbounded-pes-on-pid
@@ -1122,116 +1228,223 @@
       (check-bridge-test
        (equalp rebuilt expected))
       (check-bridge-test
+       (= (ts-pid (nth intermediate-null-index output))
+          +test-video-pid+))
+      ;; PES完了後の将来nullは借用せずbyte-exactに残す。
+      (check-bridge-test
+       (equalp (car (last output)) trailing-null))
+      (check-bridge-test
+       (payload-continuity-valid-p
+        output +test-video-pid+)))))
+
+(define-bridge-test av1-initial-byte-fifo-uses-interleaved-null-capacity
+  (multiple-value-bind (input expected intermediate-null-index)
+      (make-av1-initial-interleaved-null-fixture)
+    (let* ((output
+             (run-packet-processor input :av1 :aac))
+           (rebuilt
+             (first-unbounded-pes-on-pid
+              output +test-video-pid+)))
+      (check-bridge-test
+       (= (length output) (length input)))
+      (check-bridge-test (equalp rebuilt expected))
+      (check-bridge-test
+       (= (ts-pid (nth intermediate-null-index output))
+          +test-video-pid+))
+      (check-bridge-test
        (= (ts-pid (car (last output)))
           +test-video-pid+))
       (check-bridge-test
        (payload-continuity-valid-p
         output +test-video-pid+)))))
 
-(define-bridge-test av1-initial-byte-fifo-rejects-future-null-use
+(define-bridge-test av1-pusi-boundary-rejects-residual-without-carry
   (multiple-value-bind (input expected intermediate-null-index)
       (make-av1-initial-interleaved-null-fixture)
-    (declare (ignore expected intermediate-null-index))
-    (check-bridge-test
-     (handler-case
-         (progn
-           (run-packet-processor input :av1 :aac)
-           nil)
-       (bridge-error (condition)
-         (search
-          "REPACKETIZE_CAPACITY_EXHAUSTED residual_bytes=4"
-          (bridge-error-message condition)))))))
-
-(define-bridge-test av1-replacement-keeps-oldest-byte-deadline
-  (let* ((transport-rate-kbps 1504)
-         (first-video
-           (packetize-test-video-with-pcr
-            (make-pes
-             #xe0
-             (make-test-av1-access-unit 8)
-             90000)
-            :continuity-counter 0
-            :pcr-lead-ticks
-            +test-tstd-removal-delay-ticks+))
-         (intermediate-pcrs
-           (loop for timestamp from 99000 to 171000 by 9000
-                 collect
-                 (make-test-program-pcr-packet
-                  timestamp
-                  :counter
-                  (logand (length first-video) #x0f))))
-         (second-access-unit
-           (concatenate-octets
-            (make-av1-structure-test-sequence :level 9)
-            (make-av1-structure-test-obu
-             15
-             (make-array 260
-                         :element-type 'octet
-                         :initial-element 0))
-            (make-av1-structure-test-key-frame)))
-         (second-pes
-           (make-pes #xe0 second-access-unit 180000))
-         (second-video nil)
-         (prefix
-           (append
-            (make-test-pat-packets)
-            (make-test-pmt-packets :two-audio-p nil)
-            first-video
-            intermediate-pcrs))
-         (origin-slot (length prefix))
-         (null-packet (make-output-null-packet)))
-    ;; 長さ0の第2 PESでlevel変更PMTを前置し、最初の変換残留を
-    ;; 第2 target replacementへ跨がせる。
-    (setf (aref second-pes 4) 0
-          (aref second-pes 5) 0
-          second-video
-          (packetize-payload
-           +test-video-pid+
-           second-pes
-           :continuity-counter
-           (logand (length first-video) #x0f)
-           :payload-unit-start t))
-    (check-bridge-test (= (length second-video) 2))
-    (let* ((input
+    (declare (ignore expected))
+    (let* ((without-null
+             (loop for packet in input
+                   for index from 0
+                   unless (= index intermediate-null-index)
+                     collect packet))
+           (last-video
+             (find +test-video-pid+ without-null
+                   :key #'ts-pid :test #'= :from-end t))
+           (next-pusi
+             (first
+              (packetize-test-video-with-pcr
+               (make-pes
+                #xe0
+                (make-test-av1-access-unit 8)
+                180000)
+               :continuity-counter
+               (logand
+                (+ (ts-continuity-counter last-video) 1)
+                #x0f)
+               :discontinuity nil
+               :pcr-lead-ticks
+               +test-tstd-removal-delay-ticks+)))
+           (pusi-origin (length without-null))
+           (source
              (retime-test-pcrs-for-cbr
               (append
-               prefix
-               (list
-                (first second-video)
-                (make-ts-packet
-                 +test-data-pid+ 1 (octets 1 2 3))
-                (second second-video)
-                (make-ts-packet
-                 +test-data-pid+ 2 (octets 4 5 6))
-                null-packet
-                (copy-seq null-packet)))
-              transport-rate-kbps))
+               without-null
+               (list next-pusi
+                     (make-output-null-packet)))
+              +test-transport-rate-kbps+))
            (output (make-instance 'octet-collector-stream))
            (processor
              (make-bridge-processor
               output :av1 :aac
               :transport-rate-kbps
-              transport-rate-kbps))
+              +test-transport-rate-kbps+))
            (message
              (handler-case
                  (progn
-                   (dolist (packet input)
+                   (dolist (packet source)
                      (process-bridge-packet
                       processor (copy-seq packet)))
                    nil)
                (bridge-error (condition)
-                 (bridge-error-message condition)))))
-      ;; 1504Kbpsでは1 slot=1ms。origin末尾から3ms後のslotまで
-      ;; replacement化でdeadlineを更新せず、直前の通常slotで拒否する。
+                 (bridge-error-message condition))))
+           (pending-pusi
+             (loop for entry =
+                     (bridge-processor-pending-head processor)
+                       then (pending-entry-next entry)
+                   while entry
+                   when (= (pending-entry-slot-index entry)
+                           pusi-origin)
+                     return entry)))
       (check-bridge-test
-       (equal
-        message
-        (format
-         nil
-         "REPACKETIZE_CAPACITY_EXHAUSTED origin_slot=~D deadline_slot=~D actual_slot=~D"
-         origin-slot
-         (+ origin-slot 2)
-         (+ origin-slot 3)))))))
+       (and message
+            (search
+             "REPACKETIZE_CAPACITY_EXHAUSTED residual_bytes="
+             message :test #'char=)))
+      ;; 旧PES残留は次PUSIやその後のnullへcarryせず、その場で拒否する。
+      (check-bridge-test pending-pusi)
+      (check-bridge-test
+       (= (pending-entry-slot-index pending-pusi)
+          pusi-origin))
+      (check-bridge-test
+       (equalp
+        (pending-entry-packet pending-pusi)
+        (nth pusi-origin source)))
+      (check-bridge-test
+       (ts-payload-unit-start-p
+        (pending-entry-packet pending-pusi))))))
+
+(define-bridge-test av1-eof-boundary-rejects-residual-without-carry
+  (multiple-value-bind (input expected intermediate-null-index)
+      (make-av1-initial-interleaved-null-fixture)
+    (declare (ignore expected))
+    (let* ((without-null
+             (loop for packet in input
+                   for index from 0
+                   unless (= index intermediate-null-index)
+                     collect packet))
+           (source
+             (retime-test-pcrs-for-cbr
+              without-null +test-transport-rate-kbps+))
+           (pusi-origin
+             (position-if
+              (lambda (packet)
+                (and
+                 (= (ts-pid packet) +test-video-pid+)
+                 (ts-payload-unit-start-p packet)))
+              source))
+           (source-pusi (nth pusi-origin source))
+           (output (make-instance 'octet-collector-stream))
+           (processor
+             (make-bridge-processor
+              output :av1 :aac
+              :transport-rate-kbps
+              +test-transport-rate-kbps+))
+           (process-message
+             (handler-case
+                 (progn
+                   (dolist (packet source)
+                     (process-bridge-packet
+                      processor (copy-seq packet)))
+                   nil)
+               (bridge-error (condition)
+                 (bridge-error-message condition))))
+           (finish-message
+             (and
+              (null process-message)
+              (handler-case
+                  (progn
+                    (finish-bridge-processor processor)
+                    nil)
+                (bridge-error (condition)
+                  (bridge-error-message condition)))))
+           (pending-pusi
+             (loop for entry =
+                     (bridge-processor-pending-head processor)
+                       then (pending-entry-next entry)
+                   while entry
+                   when (= (pending-entry-slot-index entry)
+                           pusi-origin)
+                     return entry)))
+      (check-bridge-test (null process-message))
+      (check-bridge-test
+       (and finish-message
+            (search
+             "REPACKETIZE_CAPACITY_EXHAUSTED residual_bytes="
+             finish-message :test #'char=)))
+      ;; EOFでも残留を将来slotへ持ち越さず、固定PUSI/PCR sourceを保つ。
+      (check-bridge-test pending-pusi)
+      (check-bridge-test
+       (= (pending-entry-slot-index pending-pusi)
+          pusi-origin))
+      (check-bridge-test
+       (equalp
+        (pending-entry-packet pending-pusi)
+        source-pusi))
+      (check-bridge-test
+       (= (ts-pcr (pending-entry-packet pending-pusi))
+          (ts-pcr source-pusi))))))
+
+(define-bridge-test av1-target-holdback-resolves-at-exact-two-ms
+  (let* ((transport-rate-kbps 1504)
+         (processor
+             (make-bridge-processor
+              (make-instance 'octet-collector-stream)
+              :av1 :aac
+              :transport-rate-kbps transport-rate-kbps))
+         (assembler
+           (%make-pes-assembler +test-video-pid+ :video))
+         (entry
+           (make-pending-entry
+            :packet
+            (make-ts-packet
+             +test-video-pid+ 0
+             (make-array 184
+                         :element-type 'octet
+                         :initial-element #xff))
+            :slot-index 0
+            :resolved-p nil
+            :use-original-p nil)))
+    (append-av1-stream-byte-segment
+     processor assembler (octets #x11) 0)
+    (enqueue-av1-stream-target-entry assembler entry)
+    ;; H=2。slot 1では未確定、slot 2到達と同じ呼出しで部分targetを確定する。
+    (check-bridge-test
+     (zerop
+      (resolve-ready-av1-stream-target-entries
+       processor assembler :current-slot 1)))
+    (check-bridge-test (not (pending-entry-resolved-p entry)))
+    (check-bridge-test
+     (= (resolve-ready-av1-stream-target-entries
+         processor assembler :current-slot 2)
+        1))
+    (check-bridge-test (pending-entry-resolved-p entry))
+    (let ((provenance
+            (first
+             (pending-entry-replacement-provenances entry))))
+      (check-bridge-test
+       (= (replacement-provenance-origin-slot provenance) 0))
+      (check-bridge-test
+       (= (replacement-provenance-deadline-slot provenance) 2)))))
 
 (define-bridge-test strict-stream-reader-handles-partial-reads
   (let* ((vp9-frame

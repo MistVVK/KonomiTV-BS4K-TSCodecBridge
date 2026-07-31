@@ -11,6 +11,38 @@
    :tier tier
    :low-delay-mode-p low-delay-mode-p))
 
+(defun tstd-transport-packet-overflow-reference-p
+    (model arrival rate)
+  "実際のbyte逐次TB処理で1 packetがoverflowするか非破壊で返す。"
+  (let ((reference (copy-tstd-model model)))
+    (setf
+     (tstd-model-rx-bytes-per-second reference)
+     rate)
+    (handler-case
+        (progn
+          (process-tstd-transport-packet reference arrival)
+          nil)
+      (bridge-error (condition)
+        (if (search
+             "TSTD_TB_OVERFLOW"
+             (bridge-error-message condition)
+             :test #'char=)
+            t
+            (error condition))))))
+
+(defun tstd-transport-predictor-state (model)
+  "TB overflow予測の非破壊性を検査するscalar stateを返す。"
+  (list
+   (tstd-model-packet-index model)
+   (tstd-model-rx-bytes-per-second model)
+   (tstd-model-transport-buffer-fullness model)
+   (tstd-model-transport-buffer-last-arrival model)
+   (tstd-model-transport-buffer-service-end model)
+   (tstd-model-transport-buffer-busy-start model)
+   (tstd-model-transport-buffer-last-empty model)
+   (tstd-model-current-access-unit model)
+   (tstd-model-pending-access-units model)))
+
 (define-bridge-test tstd-pcr-clock-uses-first-byte-anchor
   (let* ((clock (make-tstd-arrival-clock 2200))
          (packet-index 10)
@@ -57,6 +89,159 @@
         ;; 連続して非空になるため二つ目のarrivalでfail closedにする。
         (process-tstd-transport-packet continuous 0)
         (process-tstd-transport-packet continuous 1/2))))))
+
+(define-bridge-test tstd-tb-overflow-predictor-matches-byte-recurrence
+  (let ((seed #x13579bdf)
+        (checked-count 0)
+        (rate-change-count 0)
+        (transport-rates '(1504 2200 10470 20000))
+        (rx-rates '(50000 100000 188000 376000
+                    825000 1500000 3000000)))
+    (labels
+        ((next-random (limit)
+           ;; 実行ごとに同じ実在可能state集合を作る決定的LCG。
+           (setf seed
+                 (logand
+                  #xffffffff
+                  (+ (* seed 1664525) 1013904223)))
+           (mod seed limit)))
+      (loop repeat 300
+            do
+        (let* ((transport-rate
+                 (nth (next-random (length transport-rates))
+                      transport-rates))
+               (setup-rate
+                 (nth (next-random (length rx-rates))
+                      rx-rates))
+               (candidate-rate
+                 (nth (next-random (length rx-rates))
+                      rx-rates))
+               (setup-count (next-random 7))
+               (model (make-tstd-model transport-rate))
+               (clock (tstd-model-clock model))
+               (slot-index 0))
+          (setf
+           (tstd-model-rx-bytes-per-second model)
+           setup-rate)
+          (handler-case
+            (progn
+                ;; 公開の逐次処理だけで予測直前のstateを作る。
+                (loop repeat setup-count
+                      do
+                  (incf slot-index (1+ (next-random 5)))
+                  (process-tstd-transport-packet
+                   model
+                   (tstd-packet-arrival-time
+                    clock slot-index)))
+                (incf slot-index (1+ (next-random 8)))
+                (let* ((arrival
+                         (tstd-packet-arrival-time
+                          clock slot-index))
+                       (before
+                         (tstd-transport-predictor-state model))
+                       (predicted
+                         (tstd-transport-packet-overflow-p
+                          model arrival candidate-rate))
+                       (reference
+                         (tstd-transport-packet-overflow-reference-p
+                          model arrival candidate-rate)))
+                  (check-bridge-test (eq predicted reference))
+                  (check-bridge-test
+                   (equal
+                    before
+                    (tstd-transport-predictor-state model)))
+                  (incf checked-count)
+                  (unless (= setup-rate candidate-rate)
+                    (incf rate-change-count))))
+            (bridge-error (condition)
+              ;; 遅いRxでsetup中に512 byteを越えた組だけを除外する。
+              (unless (search
+                       "TSTD_TB_OVERFLOW"
+                       (bridge-error-message condition)
+                       :test #'char=)
+                (error condition)))))))
+    (check-bridge-test (> checked-count 150))
+    (check-bridge-test (> rate-change-count 100))))
+
+(define-bridge-test tstd-tb-overflow-predictor-uses-next-pusi-rate
+  (let* ((model (make-tstd-model 10470))
+         (clock (tstd-model-clock model))
+         (next-access-unit
+           (make-tstd-access-unit
+            :rx-bytes-per-second 825000)))
+    (setf
+     (tstd-model-rx-bytes-per-second model) 825000)
+    (dotimes (packet-index 7)
+      (process-tstd-transport-packet
+       model
+       (tstd-packet-arrival-time clock packet-index)))
+    (setf
+     (tstd-model-packet-index model) 7
+     (tstd-model-rx-bytes-per-second model) 2000000
+     (tstd-model-pending-access-units model)
+     (list next-access-unit))
+    (let ((before (tstd-transport-predictor-state model)))
+      (check-bridge-test
+       (not
+        (tstd-video-packet-would-overflow-p model)))
+      (check-bridge-test
+       (tstd-video-packet-would-overflow-p
+        model :payload-unit-start-p t))
+      (check-bridge-test
+       (equal
+        before
+        (tstd-transport-predictor-state model))))))
+
+(define-bridge-test tstd-tb-arrival-is-byte-paced
+  (let* ((model (make-tstd-model 10470))
+         (clock (tstd-model-clock model)))
+    (setf
+     (tstd-model-rx-bytes-per-second model)
+     825000)
+    ;; AV1 Level 3.0のRxでは7連続packetまで512 byte TBに収まる。
+    (dotimes (packet-index 7)
+      (process-tstd-transport-packet
+       model
+       (tstd-packet-arrival-time clock packet-index)))
+    (check-bridge-test
+     (= (tstd-model-transport-buffer-fullness model)
+        169984/349))
+    ;; 8 packet目はoffset 67で初めて上限を越える。
+    (let ((message
+            (handler-case
+                (progn
+                  (process-tstd-transport-packet
+                   model
+                   (tstd-packet-arrival-time clock 7))
+                  nil)
+              (bridge-error (condition)
+                (bridge-error-message condition)))))
+      (check-bridge-test
+       (and
+        message
+        (search
+         "TSTD_TB_OVERFLOW fullness=178756/349 capacity=512"
+         message
+         :test #'char=))))))
+
+(define-bridge-test tstd-tb-fast-drain-waits-for-each-byte
+  (let ((model (make-tstd-model 1504)))
+    ;; Rxがtransport byte rateより速い場合、各byteは次の到着前に空化する。
+    (setf
+     (tstd-model-rx-bytes-per-second model)
+     376000)
+    (let ((departures
+            (process-tstd-transport-packet model 0)))
+      (check-bridge-test
+       (= (aref departures 0) 1/376000))
+      (check-bridge-test
+       (= (aref departures 187) 375/376000))
+      (check-bridge-test
+       (= (tstd-model-transport-buffer-fullness model) 1)))
+    (finish-tstd-transport-busy-period model :eof)
+    (check-bridge-test
+     (= (tstd-model-transport-buffer-last-empty model)
+        375/376000))))
 
 (define-bridge-test tstd-tb-final-boundaries-fail-closed
   (dolist (boundary '(:eof :discontinuity))
@@ -357,7 +542,7 @@
       +test-video-pid+ 1 (octets 1 2 3)))
     (check-bridge-test
      (= (tstd-model-transport-buffer-fullness model)
-        +ts-packet-size+))
+        23313/125))
     (process-tstd-output-packet
      model
      (make-ts-packet
@@ -689,6 +874,180 @@
      (= (bridge-options-transport-rate-kbps options)
         2200))))
 
+(define-bridge-test repacketize-holdback-emits-head-at-exact-boundary
+  (let* ((output (make-instance 'octet-collector-stream))
+         (processor
+           (make-bridge-processor
+            output :av1 :aac
+            :transport-rate-kbps 1504))
+         (packets
+           (loop repeat 3
+                 collect (make-output-null-packet))))
+    (check-bridge-test
+     (= (repacketize-holdback-slot-count processor) 2))
+    (append-pending-entry processor (first packets))
+    (flush-resolved-entries processor)
+    (check-bridge-test
+     (zerop (length (collected-octets output))))
+    (append-pending-entry processor (second packets))
+    (flush-resolved-entries processor)
+    (check-bridge-test
+     (zerop (length (collected-octets output))))
+    ;; tail-slot - head-slot = H となった同じ呼出しでheadを出力する。
+    (append-pending-entry processor (third packets))
+    (flush-resolved-entries processor)
+    (check-bridge-test
+     (= (length (collected-octets output))
+        +ts-packet-size+))
+    (check-bridge-test
+     (= (pending-entry-slot-index
+         (bridge-processor-pending-head processor))
+        1))
+    (check-bridge-test
+     (= (bridge-processor-pending-count processor) 2))))
+
+(defun make-test-backfill-processor ()
+  "PMT backfill境界試験用の1504kbps processorを返す。"
+  (make-bridge-processor
+   (make-instance 'octet-collector-stream)
+   :av1 :aac
+   :transport-rate-kbps 1504))
+
+(defun make-test-fixed-video-pusi ()
+  "backfill試験用のPCR付きPUSI packetを返す。"
+  (first
+   (packetize-test-video-with-pcr
+    (make-pes
+     #xe0
+     (make-test-av1-access-unit 8)
+     90000)
+    :continuity-counter 7
+    :pcr-lead-ticks
+    +test-tstd-removal-delay-ticks+)))
+
+(define-bridge-test pmt-backfill-allows-latest-at-information-deadline
+  (let* ((processor (make-test-backfill-processor))
+         (ordinary
+           (make-ts-packet +test-data-pid+ 0 (octets 1)))
+         (null-packet (make-output-null-packet))
+         (pusi-packet (make-test-fixed-video-pusi))
+         (pusi-copy (copy-seq pusi-packet))
+         (pmt-packet
+           (make-ts-packet
+            +test-pmt-pid+ 5 (octets 0 1 2)
+            :payload-unit-start t))
+         (old-entry
+           (append-pending-entry processor ordinary))
+         (null-entry
+           (append-pending-entry processor null-packet))
+         (pusi-entry
+           (append-pending-entry processor pusi-packet))
+         (latest-entry
+           (append-pending-entry processor ordinary)))
+    (declare (ignore old-entry latest-entry))
+    ;; origin=2, latest=origin+1（M=1の情報期限）でorigin-1のnullを使える。
+    (backfill-synthetic-pmt-before-video
+     processor (list pmt-packet) pusi-entry)
+    (check-bridge-test
+     (= (pending-entry-slot-index null-entry) 1))
+    (check-bridge-test
+     (equalp (pending-entry-packet null-entry) pmt-packet))
+    (check-bridge-test
+     (= (pending-entry-slot-index pusi-entry) 2))
+    (check-bridge-test
+     (equalp (pending-entry-packet pusi-entry) pusi-copy))))
+
+(define-bridge-test pmt-backfill-rejects-information-after-deadline
+  (let* ((processor (make-test-backfill-processor))
+         (ordinary
+           (make-ts-packet +test-data-pid+ 0 (octets 1)))
+         (pmt-packet
+           (make-ts-packet
+            +test-pmt-pid+ 5 (octets 0 1 2)
+            :payload-unit-start t))
+         (null-entry
+           (append-pending-entry
+            processor (make-output-null-packet)))
+         (ordinary-entry
+           (append-pending-entry processor ordinary))
+         (pusi-entry
+           (append-pending-entry
+            processor (make-test-fixed-video-pusi))))
+    (declare (ignore null-entry ordinary-entry))
+    (append-pending-entry processor ordinary)
+    (append-pending-entry processor ordinary)
+    ;; origin=2, latest=origin+2 はM=1の情報期限 origin+1 を越える。
+    (let ((message
+            (handler-case
+                (progn
+                  (backfill-synthetic-pmt-before-video
+                   processor (list pmt-packet) pusi-entry)
+                  nil)
+              (bridge-error (condition)
+                (bridge-error-message condition)))))
+      (check-bridge-test
+       (and message
+            (search
+             "reason=pmt_backfill_information_deadline"
+             message :test #'char=))))))
+
+(define-bridge-test pmt-backfill-rejects-future-null
+  (let ((processor (make-test-backfill-processor))
+        (ordinary
+          (make-ts-packet +test-data-pid+ 0 (octets 1)))
+        (pmt-packet
+          (make-ts-packet
+           +test-pmt-pid+ 5 (octets 0 1 2)
+           :payload-unit-start t)))
+    (append-pending-entry processor ordinary)
+    (let ((pusi-entry
+            (append-pending-entry
+             processor (make-test-fixed-video-pusi))))
+      ;; future nullは保持窓内でもPUSI先行PMTには使えない。
+      (append-pending-entry processor (make-output-null-packet))
+      (let ((message
+              (handler-case
+                  (progn
+                    (backfill-synthetic-pmt-before-video
+                     processor (list pmt-packet) pusi-entry)
+                    nil)
+                (bridge-error (condition)
+                  (bridge-error-message condition)))))
+        (check-bridge-test
+         (and message
+              (search
+               "reason=pmt_backfill_null_slots"
+               message :test #'char=)))))))
+
+(define-bridge-test pmt-backfill-rejects-null-older-than-holdback
+  (let ((processor (make-test-backfill-processor))
+        (ordinary
+          (make-ts-packet +test-data-pid+ 0 (octets 1)))
+        (pmt-packet
+          (make-ts-packet
+           +test-pmt-pid+ 5 (octets 0 1 2)
+           :payload-unit-start t)))
+    (append-pending-entry processor (make-output-null-packet))
+    (append-pending-entry processor ordinary)
+    (append-pending-entry processor ordinary)
+    (let* ((pusi-entry
+             (append-pending-entry
+              processor (make-test-fixed-video-pusi)))
+           (message
+             (handler-case
+                 (progn
+                   (backfill-synthetic-pmt-before-video
+                    processor (list pmt-packet) pusi-entry)
+                   nil)
+               (bridge-error (condition)
+                 (bridge-error-message condition)))))
+      ;; origin-3のnullは未出力でも候補に戻さない。
+      (check-bridge-test
+       (and message
+            (search
+             "reason=pmt_backfill_null_slots"
+             message :test #'char=))))))
+
 (define-bridge-test fixed-packet-allocator-consumes-null-slots
   (let* ((output (make-instance 'octet-collector-stream))
          (processor
@@ -777,6 +1136,146 @@
       (check-bridge-test (equalp (first packets) primary))
       (check-bridge-test (equalp (second packets) pcr))
       (check-bridge-test (equalp (third packets) extra)))))
+
+(define-bridge-test fixed-packet-allocator-keeps-header-flags-byte-exact
+  (let* ((output (make-instance 'octet-collector-stream))
+         (processor
+           (make-bridge-processor output :vp9 :aac))
+         (source
+           (make-ts-packet #x101 12 (octets 1)))
+         (fixed-discontinuity
+           (make-ts-packet
+            #x101 13 (octets 2 3)
+            :payload-unit-start t
+            :random-access t
+            :elementary-stream-priority t
+            :transport-priority t))
+         (queued
+           (make-ts-packet #x101 14 (octets 4 5)))
+         (null-packet (make-output-null-packet)))
+    (setf
+     (aref fixed-discontinuity 5)
+     (logior (aref fixed-discontinuity 5) #x80))
+    (allocate-output-entry
+     processor
+     (make-pending-entry
+      :packet source
+      :resolved-p t
+      :use-original-p nil
+      :replacements
+      (list fixed-discontinuity queued)))
+    (allocate-output-entry
+     processor
+     (make-pending-entry
+      :packet null-packet
+      :resolved-p t
+      :use-original-p t))
+    (let ((packets
+            (octets-to-packet-list
+             (collected-octets output))))
+      (check-bridge-test
+       (equalp packets
+               (list fixed-discontinuity queued)))
+      (check-bridge-test
+       (ts-payload-unit-start-p (first packets)))
+      (check-bridge-test
+       (= (ts-continuity-counter (first packets)) 13))
+      (check-bridge-test
+       (ts-random-access-indicator-p (first packets)))
+      (check-bridge-test
+       (ts-elementary-stream-priority-indicator-p
+        (first packets)))
+      (check-bridge-test
+       (ts-discontinuity-indicator-p (first packets))))))
+
+(define-bridge-test fixed-packet-allocator-rejects-delayed-discontinuity
+  (let* ((output (make-instance 'octet-collector-stream))
+         (processor
+           (make-bridge-processor output :vp9 :aac))
+         (source (make-ts-packet #x101 0 (octets 1)))
+         (primary (make-ts-packet #x101 0 (octets 2)))
+         (queued (make-ts-packet #x101 1 (octets 3)))
+         (next-source (make-ts-packet #x101 2 (octets 4)))
+         (discontinuity
+           (make-ts-packet #x101 2 (octets 5))))
+    (setf
+     (aref discontinuity 5)
+     (logior (aref discontinuity 5) #x80))
+    (allocate-output-entry
+     processor
+     (make-pending-entry
+      :packet source
+      :resolved-p t
+      :use-original-p nil
+      :replacements (list primary queued)))
+    (let ((message
+            (handler-case
+                (progn
+                  (allocate-output-entry
+                   processor
+                   (make-pending-entry
+                    :packet next-source
+                    :resolved-p t
+                    :use-original-p nil
+                    :replacements (list discontinuity)))
+                  nil)
+              (bridge-error (condition)
+                (bridge-error-message condition)))))
+      (check-bridge-test
+       (and
+        message
+        (search
+         "REPACKETIZE_DISCONTINUITY_CANNOT_USE_RECLAIMED_SLOT"
+         message
+         :test #'char=)))
+      ;; fail-closedはcurrent slotを部分出力しない。
+      (check-bridge-test
+       (= (length (collected-octets output))
+          +ts-packet-size+)))))
+
+(define-bridge-test fixed-packet-allocator-rejects-fixed-pcr-collision
+  (let* ((output (make-instance 'octet-collector-stream))
+         (processor
+           (make-bridge-processor output :vp9 :aac))
+         (source (make-ts-packet #x101 0 (octets 1)))
+         (primary (make-ts-packet #x101 0 (octets 2)))
+         (queued (make-ts-packet #x101 1 (octets 3)))
+         (pcr
+           (make-test-program-pcr-packet
+            90000 :counter 2)))
+    (setf
+     (bridge-processor-current-pcr-pid processor)
+     +test-video-pid+)
+    (allocate-output-entry
+     processor
+     (make-pending-entry
+      :packet source
+      :resolved-p t
+      :use-original-p nil
+      :replacements (list primary queued)))
+    (let ((message
+            (handler-case
+                (progn
+                  (allocate-output-entry
+                   processor
+                   (make-pending-entry
+                    :packet pcr
+                    :resolved-p t
+                    :use-original-p nil
+                    :replacements (list (copy-seq pcr))))
+                  nil)
+              (bridge-error (condition)
+                (bridge-error-message condition)))))
+      (check-bridge-test
+       (and
+        message
+        (search
+         "REPACKETIZE_PREFIX_CANNOT_PRECEDE_FIXED_PCR"
+         message
+         :test #'char=)))
+      (check-bridge-test
+       (= (length (collected-octets output))
+          +ts-packet-size+)))))
 
 (define-bridge-test fixed-packet-allocator-enforces-two-ms-deadline
   (let* ((output (make-instance 'octet-collector-stream))
@@ -910,6 +1409,192 @@
       (check-bridge-test
        (equalp packets
                (list first-primary first-extra second-primary)))
+      (check-bridge-test
+       (zerop
+        (bridge-processor-output-packet-count processor))))))
+
+(defun configure-forced-tstd-smoothing-state (processor)
+  "次の映像packetだけがTB overflowする実数fullness stateを設定する。"
+  (let ((model (bridge-processor-tstd-model processor)))
+    (setf
+     (tstd-model-video-pid model) +test-video-pid+
+     (tstd-model-rx-bytes-per-second model) 100000
+     ;; このallocator試験ではPES/MBではなくTB平準化だけを対象にする。
+     (tstd-model-discarding-access-unit-p model) t
+     (tstd-model-transport-buffer-fullness model) 500
+     (tstd-model-transport-buffer-last-arrival model) 0
+     (tstd-model-transport-buffer-service-end model) 1/200
+     (tstd-model-transport-buffer-busy-start model) 0)
+    model))
+
+(define-bridge-test fixed-packet-allocator-smoothing-uses-two-ms-boundary
+  (let* ((output (make-instance 'octet-collector-stream))
+         (processor
+           (make-bridge-processor
+            output :av1 :aac
+            :transport-rate-kbps 1504))
+         (candidate
+           (make-ts-packet
+            +test-video-pid+ 7 (octets 7)))
+         (ordinary
+           (make-ts-packet #x120 0 (octets 9)))
+         (null-packet (make-output-null-packet)))
+    (configure-forced-tstd-smoothing-state processor)
+    (allocate-output-entry
+     processor
+     (make-pending-entry
+      :packet
+      (make-ts-packet +test-video-pid+ 7 (octets #xff))
+      :resolved-p t
+      :use-original-p nil
+      :replacements (list candidate)
+      :replacement-provenances
+      (list
+       (make-replacement-provenance
+        :origin-slot 0
+        :deadline-slot 2))))
+    ;; slot 0で平準化queueへ送り、slot 3先頭（待ち時間ちょうど2ms）
+    ;; のnull容量でbyte-exactに回収する。
+    (loop repeat 2
+          do
+      (allocate-output-entry
+       processor
+       (make-pending-entry
+        :packet ordinary
+        :resolved-p t
+        :use-original-p t)))
+    (allocate-output-entry
+     processor
+     (make-pending-entry
+      :packet null-packet
+      :resolved-p t
+      :use-original-p t))
+    (let ((packets
+            (octets-to-packet-list
+             (collected-octets output))))
+      (check-bridge-test (= (length packets) 4))
+      (check-bridge-test
+       (= (ts-pid (first packets)) +ts-null-pid+))
+      (check-bridge-test (equalp (fourth packets) candidate))
+      (check-bridge-test
+       (zerop
+        (bridge-processor-output-packet-count processor))))))
+
+(define-bridge-test fixed-packet-allocator-smoothing-fails-after-two-ms
+  (let* ((output (make-instance 'octet-collector-stream))
+         (processor
+           (make-bridge-processor
+            output :av1 :aac
+            :transport-rate-kbps 1504))
+         (candidate
+           (make-ts-packet
+            +test-video-pid+ 7 (octets 7)))
+         (ordinary
+           (make-ts-packet #x120 0 (octets 9))))
+    (configure-forced-tstd-smoothing-state processor)
+    (allocate-output-entry
+     processor
+     (make-pending-entry
+      :packet
+      (make-ts-packet +test-video-pid+ 7 (octets #xff))
+      :resolved-p t
+      :use-original-p nil
+      :replacements (list candidate)
+      :replacement-provenances
+      (list
+       (make-replacement-provenance
+        :origin-slot 0
+        :deadline-slot 2))))
+    (loop repeat 2
+          do
+      (allocate-output-entry
+       processor
+       (make-pending-entry
+        :packet ordinary
+        :resolved-p t
+        :use-original-p t)))
+    ;; slot 3も固定packetなら次に使えるslot 4は期限外なので即時fail。
+    (let ((message
+            (handler-case
+                (progn
+                  (allocate-output-entry
+                   processor
+                   (make-pending-entry
+                    :packet ordinary
+                    :resolved-p t
+                    :use-original-p t))
+                  nil)
+              (bridge-error (condition)
+                (bridge-error-message condition)))))
+      (check-bridge-test
+       (and
+        message
+        (search
+         "REPACKETIZE_CAPACITY_EXHAUSTED origin_slot=0 deadline_slot=2 actual_slot=3"
+         message
+         :test #'char=)))
+      (check-bridge-test
+       (= (length (collected-octets output))
+          (* 3 +ts-packet-size+))))))
+
+(define-bridge-test fixed-packet-allocator-paces-av1-tb-with-null
+  (let* ((output (make-instance 'octet-collector-stream))
+         (processor
+           (make-bridge-processor
+            output :av1 :aac
+            :transport-rate-kbps 10470))
+         (model (bridge-processor-tstd-model processor))
+         (replacements
+           (loop for index below 8
+                 collect
+             (make-ts-packet
+              +test-video-pid+
+              (logand index #x0f)
+              (octets index)))))
+    (setf
+     (tstd-model-video-pid model) +test-video-pid+
+     (tstd-model-rx-bytes-per-second model) 825000
+     ;; この単体試験ではPES/MBではなくTB平準化だけを対象にする。
+     (tstd-model-discarding-access-unit-p model) t)
+    (loop for replacement in replacements
+          do
+      (allocate-output-entry
+       processor
+       (make-pending-entry
+        :packet
+        (make-ts-packet
+         +test-video-pid+
+         (ts-continuity-counter replacement)
+         (octets #xff))
+        :resolved-p t
+        :use-original-p nil
+        :replacements (list replacement))))
+    ;; 8個目を置くと真にoverflowするslotはnullへreclaimされ、
+    ;; 直後の既存null slotで同じpacketを2ms以内に回収する。
+    (allocate-output-entry
+     processor
+     (make-pending-entry
+      :packet (make-output-null-packet)
+      :resolved-p t
+      :use-original-p t))
+    (let* ((packets
+             (octets-to-packet-list
+              (collected-octets output)))
+           (video-packets
+             (remove-if-not
+              (lambda (packet)
+                (= (ts-pid packet) +test-video-pid+))
+              packets)))
+      (check-bridge-test (= (length packets) 9))
+      (check-bridge-test
+       (every #'equalp video-packets replacements))
+      (check-bridge-test
+       (= (ts-pid (nth 7 packets)) +ts-null-pid+))
+      (check-bridge-test
+       (equalp (nth 8 packets) (nth 7 replacements)))
+      (check-bridge-test
+       (<= (tstd-model-transport-buffer-fullness model)
+           +tstd-transport-buffer-size+))
       (check-bridge-test
        (zerop
         (bridge-processor-output-packet-count processor))))))
