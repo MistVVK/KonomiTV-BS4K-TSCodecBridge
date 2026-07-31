@@ -5,7 +5,7 @@ set -euo pipefail
 
 script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 project_root="$(cd -- "${script_directory}/.." && pwd)"
-expected_test_count="${EXPECTED_TEST_COUNT:-160}"
+expected_test_count="${EXPECTED_TEST_COUNT:-201}"
 
 run_gate() {
     local gate_name="$1"

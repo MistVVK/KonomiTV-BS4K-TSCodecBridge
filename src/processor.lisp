@@ -1927,6 +1927,15 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
       (av1-stream-byte-segment-payload-unit-start-p
        segment)))))
 
+(defun av1-null-inside-current-pes-p (assembler entry)
+  "ENTRYのnullが現在AV1 PESのPUSI以降のslotにあるか返す。"
+  (let ((first-entry
+          (car (last (pes-assembler-entries assembler)))))
+    (and
+     first-entry
+     (<= (pending-entry-slot-index first-entry)
+         (pending-entry-slot-index entry)))))
+
 (defun allocate-output-entry (processor entry)
   "非対象/PCR slotを固定しextraはnull/reclaimed slotだけへ割り当てる。"
   (let* ((original (pending-entry-packet entry))
@@ -1955,11 +1964,10 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
            (and
             av1-assembler
             original-null-p
-            (<=
-             (av1-stream-byte-segment-origin-slot
-              (pes-assembler-av1-stream-byte-head
-               av1-assembler))
-             (pending-entry-slot-index entry))
+            (pes-assembler-av1-stream-last-template
+             av1-assembler)
+            (av1-null-inside-current-pes-p
+             av1-assembler entry)
             (pending-entry-use-original-p entry)
             (null
              (bridge-processor-output-packet-head processor))))
@@ -2011,7 +2019,7 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
                (validate-av1-stream-byte-deadline
                 processor av1-assembler)
                (setf output original))
-              (av1-assembler
+              (av1-null-consumption-p
                (setf
                 output
                 (make-av1-stream-null-continuation
@@ -2743,12 +2751,38 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
          (>= (length buffer)
              (+ 9 (aref buffer 8) 32)))))
 
+(defun streaming-output-order-ready-p (processor assembler)
+  "ASSEMBLERより前のpending entryがすべて解決済みか返す。
+
+先行PES eventが未解決の間に後続PESを逐次開始すると、後続側が
+出力continuity counterを先に予約し、最終出力順とcounter順が入れ替わる。"
+  (let ((first-entry
+          (car (last (pes-assembler-entries assembler)))))
+    (unless first-entry
+      (bridge-error "Streaming PES has no transport packets"))
+    (loop for entry = (bridge-processor-pending-head processor)
+            then (pending-entry-next entry)
+          while entry
+          do
+             (when (eq entry first-entry)
+               (return-from streaming-output-order-ready-p t))
+             (unless (pending-entry-resolved-p entry)
+               (return-from streaming-output-order-ready-p nil)))
+    (bridge-error
+     "Streaming PES first entry is absent from pending output queue")))
+
 (defun try-start-vp9-streaming (processor assembler)
   "長さ0 VP9 PESを次PUSI前に検証・識別子変換して逐次出力する。"
   (unless (and (eq (pes-assembler-kind assembler) :video)
                (eq (bridge-processor-video-codec processor) :vp9)
                (not (pes-assembler-streaming-p assembler))
                (vp9-streaming-prefix-ready-p assembler))
+    (return-from try-start-vp9-streaming nil))
+  ;; 出力CCの予約順をtransport slot順と一致させる。
+  (loop while
+        (resolve-oldest-ready-event-lookahead processor))
+  (unless (streaming-output-order-ready-p
+           processor assembler)
     (return-from try-start-vp9-streaming nil))
   (let* ((source-pes
            (coerce (pes-assembler-buffer assembler)

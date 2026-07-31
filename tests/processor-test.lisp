@@ -1558,7 +1558,34 @@
         payload))
       (check-bridge-test
        (payload-continuity-valid-p
-        output +test-video-pid+)))))
+       output +test-video-pid+)))))
+
+(define-bridge-test vp9-streaming-preserves-order-behind-unresolved-pes
+  (let* ((processor
+           (make-bridge-processor
+            (make-instance 'octet-collector-stream)
+            :vp9 :aac))
+         (assembler
+           (%make-pes-assembler +test-video-pid+ :video))
+         (earlier-entry
+           (append-pending-entry
+            processor (make-output-null-packet)))
+         (streaming-entry
+           (append-pending-entry
+            processor (make-output-null-packet))))
+    (mark-entry-unresolved earlier-entry)
+    (mark-entry-unresolved streaming-entry)
+    (setf (pes-assembler-entries assembler)
+          (list streaming-entry))
+    ;; 先行eventが未解決の間は後続PESにCCを予約させない。
+    (check-bridge-test
+     (not
+      (streaming-output-order-ready-p
+       processor assembler)))
+    (resolve-entry-as-original earlier-entry)
+    (check-bridge-test
+     (streaming-output-order-ready-p
+      processor assembler))))
 
 (define-bridge-test cli-codec-options-and-defaults
   (let ((defaults (parse-command-line '()))

@@ -1830,6 +1830,92 @@
       (lambda ()
         (finish-av1-stream-byte-fifo assembler))))))
 
+(define-bridge-test av1-byte-fifo-does-not-use-null-without-template
+  (let* ((output (make-instance 'octet-collector-stream))
+         (processor
+           (make-bridge-processor
+            output :av1 :aac
+            :transport-rate-kbps 1504))
+         (assembler
+           (%make-pes-assembler +test-video-pid+ :video))
+         (null-packet (make-output-null-packet)))
+    (setf
+     (bridge-processor-current-video-pid processor)
+     +test-video-pid+
+     (gethash
+      +test-video-pid+
+      (bridge-processor-pes-assemblers processor))
+     assembler
+     (pes-assembler-active-p assembler) t
+     (pes-assembler-streaming-p assembler) t)
+    ;; slot 4で生成されたbyteを、video template未確定のslot 0
+    ;; nullへ置くとPUSIとtransport headerを正しく構成できない。
+    (append-av1-stream-byte-segment
+     processor assembler (octets #x11) 4)
+    (allocate-output-entry
+     processor
+     (make-pending-entry
+      :packet null-packet
+      :slot-index 0
+      :resolved-p t
+      :use-original-p t))
+    (let ((packets
+            (octets-to-packet-list
+             (collected-octets output))))
+      (check-bridge-test (= (length packets) 1))
+      (check-bridge-test (equalp (first packets) null-packet))
+      (check-bridge-test
+       (= (pes-assembler-av1-stream-byte-count assembler) 1)))))
+
+(define-bridge-test av1-byte-fifo-does-not-use-null-before-current-pes
+  (let* ((output (make-instance 'octet-collector-stream))
+         (processor
+           (make-bridge-processor
+            output :av1 :aac
+            :transport-rate-kbps 1504))
+         (assembler
+           (%make-pes-assembler +test-video-pid+ :video))
+         (template
+           (make-ts-packet
+            +test-video-pid+ 0 (octets #x00)))
+         (source-entry
+           (make-pending-entry
+            :packet template
+            :slot-index 4
+            :resolved-p nil
+            :use-original-p nil))
+         (null-packet (make-output-null-packet)))
+    (setf
+     (bridge-processor-current-video-pid processor)
+     +test-video-pid+
+     (gethash
+      +test-video-pid+
+      (bridge-processor-pes-assemblers processor))
+     assembler
+     (pes-assembler-active-p assembler) t
+     (pes-assembler-streaming-p assembler) t
+     (pes-assembler-entries assembler) (list source-entry)
+     (pes-assembler-av1-stream-last-template assembler)
+     template)
+    ;; 前PESのtemplateが残っていても、現PESのPUSIより前のnullに
+    ;; 現PES先頭byteを逆行配置してはならない。
+    (append-av1-stream-byte-segment
+     processor assembler (octets #x11) 4)
+    (allocate-output-entry
+     processor
+     (make-pending-entry
+      :packet null-packet
+      :slot-index 0
+      :resolved-p t
+      :use-original-p t))
+    (let ((packets
+            (octets-to-packet-list
+             (collected-octets output))))
+      (check-bridge-test (= (length packets) 1))
+      (check-bridge-test (equalp (first packets) null-packet))
+      (check-bridge-test
+       (= (pes-assembler-av1-stream-byte-count assembler) 1)))))
+
 (define-bridge-test fixed-packet-allocator-rejects-eof-backlog
   (let ((processor
           (make-bridge-processor
