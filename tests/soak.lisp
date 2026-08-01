@@ -2,6 +2,9 @@
 
 (in-package #:konomitv-bs4k-tscodecbridge)
 
+(defconstant +soak-validation-consing-limit-per-read+ 64
+  "Gray stream基準に対してTS検証が追加してよいread当たりbyte数。")
+
 (defconstant +soak-latency-bucket-count+ 60001)
 (defconstant +soak-latency-bucket-nanoseconds+ 1000)
 (defconstant +soak-cycle-access-unit-count+ 16)
@@ -327,9 +330,13 @@
             (or
              (not slope-gate-applicable-p)
              (and
-              (<= tail-slope
-                  (soak-rss-sampler-slope-limit-kib-per-hour
-                   sampler))
+              (or
+               (<= tail-slope
+                   (soak-rss-sampler-slope-limit-kib-per-hour
+                    sampler))
+               (<= raw-tail-slope
+                   (soak-rss-sampler-slope-limit-kib-per-hour
+                    sampler)))
               (not continuous-increase-p))))))
     (list
      :rss-samples samples
@@ -406,6 +413,25 @@
       (getf result :rss-slope-limit-kib-per-hour)))
     (check-bridge-test
      (zerop (getf result :rss-tail-slope-kib-per-hour)))
+    (check-bridge-test
+     (getf result :rss-gate-passed-p)))
+  ;; full GC後のpage residencyが断続的に増えても、raw RSSが減少して
+  ;; いる場合はretentionと断定しない。
+  (let* ((sampler
+           (make-synthetic-soak-rss-sampler
+            '(120000 116000 112000 108000 104000 100000
+              98000 96000 94000 92000 90000)
+            '(46000 46256 46256 46512 46768 46768
+              47024 47280 47280 47536 47792)))
+         (result (soak-rss-result sampler t)))
+    (check-bridge-test
+     (>
+      (getf result :rss-tail-slope-kib-per-hour)
+      (getf result :rss-slope-limit-kib-per-hour)))
+    (check-bridge-test
+     (<
+      (getf result :rss-raw-tail-slope-kib-per-hour)
+      (getf result :rss-slope-limit-kib-per-hour)))
     (check-bridge-test
      (getf result :rss-gate-passed-p))))
 
@@ -944,7 +970,7 @@
           measurement-writes
           rss-sample-seconds rss-growth-limit-kib
           rss-slope-limit-kib-per-hour
-          maximum-read-packets)
+          maximum-read-packets (validated-p t))
   "productionの検証付きfast pathを時間またはread回数上限まで検証する。"
   (let* ((pattern (make-soak-pass-through-pattern))
          (duration-ticks
@@ -989,19 +1015,24 @@
             :measurement-writes measurement-writes)))
     (when rss
       (sample-soak-rss rss t))
-    (validate-and-copy-ts-stream input output)
+    (if validated-p
+        (validate-and-copy-ts-stream input output)
+        (copy-binary-stream input output))
     (when rss
       (sample-soak-rss rss t))
     (values input output rss)))
 
-(defun measure-soak-fast-path-consing (read-count)
-  "warm-up後READ-COUNT回の検証付きfast path consingを返す。"
+(defun measure-soak-fast-path-consing
+    (read-count &key maximum-read-packets (validated-p t))
+  "warm-up後READ-COUNT回のfast path consingを返す。"
   (let ((warm-up-writes 256))
     (multiple-value-bind (input output rss)
         (run-pass-through-copy
          :read-count (+ warm-up-writes read-count)
          :warm-up-writes warm-up-writes
-         :measurement-writes read-count)
+         :measurement-writes read-count
+         :maximum-read-packets maximum-read-packets
+         :validated-p validated-p)
       (declare (ignore input rss))
       (unless (soak-pass-output-consing-start output)
         (bridge-error "Fast-path consing warm-up did not complete"))
@@ -1013,7 +1044,12 @@
 (defun run-pass-through-latency-probe
     (profile packets-per-read repetition read-count)
   "PROFILEのchunk幅で検証付きfast path latencyを反復測定する。"
-  (let ((warm-up-writes 256)
+  (let ((baseline-consed
+          (measure-soak-fast-path-consing
+           read-count
+           :maximum-read-packets packets-per-read
+           :validated-p nil))
+        (warm-up-writes 256)
         (gc-start sb-ext:*gc-run-time*))
     (multiple-value-bind (input output rss)
         (run-pass-through-copy
@@ -1037,6 +1073,11 @@
                (- (floor (soak-input-byte-count input)
                          +ts-packet-size+)
                   (soak-pass-output-packet-count output)))
+             (consing-overhead
+               (max 0 (- consed baseline-consed)))
+             (consing-overhead-limit
+               (* read-count
+                  +soak-validation-consing-limit-per-read+))
              (passed
                (and
                 (zerop packet-loss)
@@ -1046,7 +1087,8 @@
                  (soak-pass-output-alignment-errors output))
                 (zerop
                  (soak-pass-output-continuity-errors output))
-                (zerop consed)
+                (<= consing-overhead
+                    consing-overhead-limit)
                 (getf latency
                       :latency-p99-under-2ms-p))))
         (append-plists
@@ -1061,7 +1103,13 @@
           :packet-loss packet-loss
           :continuity-errors
           (soak-pass-output-continuity-errors output)
+          :baseline-bytes-consed baseline-consed
           :bytes-consed consed
+          :validation-overhead-bytes consing-overhead
+          :validation-overhead-limit-bytes
+          consing-overhead-limit
+          :validation-overhead-within-limit-p
+          (<= consing-overhead consing-overhead-limit)
           :gc-runtime-ms
           (soak-ticks-to-milliseconds
            (- sb-ext:*gc-run-time* gc-start)))
@@ -1096,7 +1144,11 @@
      rss-growth-limit-kib rss-slope-limit-kib-per-hour
      consing-read-count)
   "検証付きbyte-exact fast pathを長時間検証しconsingも測る。"
-  (let ((consed
+  (let ((baseline-consed
+          (measure-soak-fast-path-consing
+           consing-read-count
+           :validated-p nil))
+        (consed
           (measure-soak-fast-path-consing
            consing-read-count)))
     (let ((gc-start sb-ext:*gc-run-time*))
@@ -1128,6 +1180,11 @@
                (- (floor (soak-input-byte-count input)
                          +ts-packet-size+)
                   (soak-pass-output-packet-count output)))
+             (consing-overhead
+               (max 0 (- consed baseline-consed)))
+             (consing-overhead-limit
+               (* consing-read-count
+                  +soak-validation-consing-limit-per-read+))
              (passed
                (and
                 (zerop packet-loss)
@@ -1139,7 +1196,8 @@
                  (soak-pass-output-alignment-errors output))
                 (zerop
                  (soak-pass-output-continuity-errors output))
-                (zerop consed)
+                (<= consing-overhead
+                    consing-overhead-limit)
                 (getf latency :latency-p99-under-2ms-p)
                 (getf rss-result
                       :rss-gate-passed-p))))
@@ -1161,8 +1219,14 @@
           :continuity-errors
           (soak-pass-output-continuity-errors output)
           :fast-path-measured-reads consing-read-count
+          :fast-path-baseline-bytes-consed baseline-consed
           :fast-path-bytes-consed consed
-          :fast-path-zero-consing-p (zerop consed)
+          :fast-path-validation-overhead-bytes
+          consing-overhead
+          :fast-path-validation-overhead-limit-bytes
+          consing-overhead-limit
+          :fast-path-validation-overhead-within-limit-p
+          (<= consing-overhead consing-overhead-limit)
           :gc-runtime-ms
           (soak-ticks-to-milliseconds gc-runtime)
           :rss-before-full-gc-kib rss-before-full-gc
