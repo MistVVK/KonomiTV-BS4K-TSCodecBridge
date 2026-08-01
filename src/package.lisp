@@ -1,5 +1,16 @@
 ;;;; SPDX-License-Identifier: 0BSD
 
+;;; Project-wide OPTIMIZE policy (must match asd :around-compile).
+;;; safety 3 / debug 2: fail-closed production diagnostics without
+;;; stripping runtime checks. speed 2: moderate optimization.
+;;; space 0 / compilation-speed 0: prefer runtime code quality over
+;;; compact FASLs or fast compiles.
+(declaim (optimize (safety 3)
+                   (speed 2)
+                   (debug 2)
+                   (space 0)
+                   (compilation-speed 0)))
+
 (defpackage #:konomitv-bs4k-tscodecbridge
   (:use #:cl)
   (:export

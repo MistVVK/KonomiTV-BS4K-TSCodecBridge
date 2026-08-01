@@ -2,6 +2,16 @@
 
 (in-package #:asdf-user)
 
+;;; Project-wide compilation policy (safety-first production).
+;;; Applied to every ASDF-compiled file via :around-compile.
+(defun konomitv-bs4k-tscodecbridge/around-compile (thunk)
+  (proclaim '(optimize (safety 3)
+                       (speed 2)
+                       (debug 2)
+                       (space 0)
+                       (compilation-speed 0)))
+  (funcall thunk))
+
 (defsystem "konomitv-bs4k-tscodecbridge"
   :version "0.1.0"
   :description "MPEG-TS codec bridge for KonomiTV-BS4K"
@@ -9,6 +19,7 @@
   :license "0BSD"
   :in-order-to ((test-op
                  (test-op "konomitv-bs4k-tscodecbridge/tests")))
+  :around-compile konomitv-bs4k-tscodecbridge/around-compile
   :pathname "src"
   :serial t
   :components
@@ -57,6 +68,7 @@
 (defsystem "konomitv-bs4k-tscodecbridge/tests"
   :description "KonomiTV-BS4K TS Codec Bridge tests"
   :depends-on ("konomitv-bs4k-tscodecbridge")
+  :around-compile konomitv-bs4k-tscodecbridge/around-compile
   :pathname "tests"
   :serial t
   :components
@@ -87,6 +99,7 @@
 (defsystem "konomitv-bs4k-tscodecbridge/executable"
   :description "Saved executable for KonomiTV-BS4K TS Codec Bridge"
   :depends-on ("konomitv-bs4k-tscodecbridge")
+  :around-compile konomitv-bs4k-tscodecbridge/around-compile
   :build-operation "program-op"
   :build-pathname "build/ts-codec-bridge.elf"
   :entry-point "konomitv-bs4k-tscodecbridge:entry-point")
