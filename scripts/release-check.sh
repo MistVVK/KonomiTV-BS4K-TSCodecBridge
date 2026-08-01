@@ -36,13 +36,10 @@ run_gate \
     'saved executable fixtures and fail-closed boundary' \
     bash "${script_directory}/test-executable.sh"
 run_gate \
-    'Docker runtime distribution static audit' \
-    bash "${script_directory}/test-docker-distribution-static.sh"
-run_gate \
     'large-PES latency and allocation gate' \
     bash "${script_directory}/benchmark-large-pes.sh"
 run_gate \
-    'fixed FFmpeg 8.1.2 sixteen-case integration matrix' \
+    'FFmpeg sixteen-case integration matrix' \
     bash "${script_directory}/test-ffmpeg-integration.sh"
 run_gate \
     'pass-through, VP9, and AV1 600-second transport, latency, allocation, and RSS soak' \

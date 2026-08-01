@@ -4,7 +4,7 @@ SHELL := /bin/bash
 
 .DEFAULT_GOAL := build
 
-.PHONY: benchmark build check clean compile docker-release-check final-release-check fixtures fixtures-check lint release-check runtime-release-audit soak soak-24h soak-600 test test-executable test-ffmpeg-integration test-runtime-image
+.PHONY: benchmark build check clean compile final-release-check fixtures fixtures-check lint release-check soak soak-24h soak-600 test test-executable test-ffmpeg-integration
 
 compile:
 	bash scripts/compile.sh
@@ -36,21 +36,11 @@ test-executable: build
 test-ffmpeg-integration:
 	bash scripts/test-ffmpeg-integration.sh
 
-test-runtime-image:
-	bash scripts/test-runtime-image.sh
-
-runtime-release-audit:
-	bash scripts/test-docker-distribution-static.sh
-
 release-check:
 	bash scripts/release-check.sh
 
 final-release-check:
 	bash scripts/final-release-check.sh
-
-docker-release-check:
-	bash scripts/build-runtime-image.sh
-	bash scripts/test-runtime-image.sh
 
 soak-600:
 	SOAK_DURATION_SECONDS=600 bash scripts/soak.sh
