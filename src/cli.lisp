@@ -224,7 +224,7 @@
              --transport-rate-kbps RATE           Required positive CBR kbit/s for AV1 only~%~
              --stream-anchor-v1                   Finalize Stream Anchor v1 timed ID3 metadata~%~
              --stream-anchor-max-distance-ticks N Maximum nearest-AU distance (default: 4500)~%~
-             AV1 input contract: FFmpeg 8.1.2/libaom realtime, base-layer OBU subset.~%~
+             AV1 input contract: FFmpeg/libaom realtime, base-layer OBU subset.~%~
              AV1 output targets the pinned 2026-03-25 AOM MPEG-2 TS draft;~%~
              input acceptance is the subset documented in spec/av1-mpeg2-ts-working-draft.md.~%~
              --pass-through                     Validated byte-exact TS copy~%~

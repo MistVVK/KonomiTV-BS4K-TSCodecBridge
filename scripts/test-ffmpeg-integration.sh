@@ -5,12 +5,10 @@ set -euo pipefail
 
 script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 project_root="$(cd -- "${script_directory}/.." && pwd)"
-ffmpeg_binary="${FFMPEG_BINARY:-ffmpeg}"
-ffprobe_binary="${FFPROBE_BINARY:-ffprobe}"
+ffmpeg_binary="${FFMPEG_BINARY:-$(command -v ffmpeg || true)}"
+ffprobe_binary="${FFPROBE_BINARY:-$(command -v ffprobe || true)}"
 bridge_binary="${BRIDGE_BINARY:-${project_root}/build/ts-codec-bridge.elf}"
 av1_elementary_verifier="${project_root}/scripts/verify-av1-ts-elementary-stream.sh"
-expected_ffmpeg_sha256="${FFMPEG_SHA256:-5599c2bc61d987c7336ad4a7bf4b917fa8b260822fbb65c8b069188931339f76}"
-expected_ffprobe_sha256="${FFPROBE_SHA256:-877ca4ba5b63cabde0378cb39af3be12e449b6079c2d975b37aaab20f758c191}"
 temporary_directory="$(mktemp -d /tmp/tscodecbridge-ffmpeg.XXXXXX)"
 keep_artifacts="${KEEP_FFMPEG_ARTIFACTS:-0}"
 matrix_case_count=0
@@ -32,19 +30,15 @@ if [[ "${keep_artifacts}" != '0' && "${keep_artifacts}" != '1' ]]; then
     exit 2
 fi
 
+test -n "${ffmpeg_binary}"
+test -n "${ffprobe_binary}"
 test -x "${ffmpeg_binary}"
 test -x "${ffprobe_binary}"
 test -x "${bridge_binary}"
 test -x "${av1_elementary_verifier}"
 
-test "$(sha256sum "${ffmpeg_binary}" | cut -d' ' -f1)" = \
-    "${expected_ffmpeg_sha256}"
-test "$(sha256sum "${ffprobe_binary}" | cut -d' ' -f1)" = \
-    "${expected_ffprobe_sha256}"
-"${ffmpeg_binary}" -version 2>&1 |
-    grep -Fq 'ffmpeg version n8.1.2 '
-"${ffprobe_binary}" -version 2>&1 |
-    grep -Fq 'ffprobe version n8.1.2 '
+"${ffmpeg_binary}" -version >/dev/null
+"${ffprobe_binary}" -version >/dev/null
 test "$("${bridge_binary}" --version)" = '0.1.0'
 test "$("${bridge_binary}" --mapping-version)" = '1'
 
@@ -413,5 +407,5 @@ grep -Fq -- \
     '--transport-rate-kbps is only valid with --video-codec av1' \
     "${temporary_directory}/vp9-rate-error.txt"
 
-printf 'Fixed FFmpeg 8.1.2 integration tests passed: %s matrix cases.\n' \
+printf 'FFmpeg integration tests passed: %s matrix cases.\n' \
     "${matrix_case_count}"

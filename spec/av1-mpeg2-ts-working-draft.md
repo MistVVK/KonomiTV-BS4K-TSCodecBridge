@@ -22,7 +22,7 @@ Buffer Pool と decoder timing は、この draft が規範参照する
   文書に定める 2026-03-25 draft の規則で検証する。これを
   **AOM draft に従う AV1 MPEG-2 TS 搬送**と呼ぶ。
 - 入力については、Bridge は汎用 AV1 decoder ではない。
-  KonomiTV が固定する FFmpeg 8.1.2 と libaom-av1 の realtime 出力を
+  統合試験に使用する FFmpeg と libaom-av1 の realtime 出力を
   対象に、entropy-coded tile payload の復号を行わず、OBU、frame header、
   tile group の構文、参照状態、timestamp に必要な意味だけを検証する。
   したがって入力 AV1 bitstream 全般への完全適合を表明しない。
@@ -204,10 +204,10 @@ PCR、discontinuity、adaptation-only packet を保持しつつ再 packetize
 PMT section の CRC32/MPEG-2、section length、descriptor loop length を
 再計算する。
 
-## 固定 encoder 統合証明
+## encoder 統合証明
 
-`scripts/test-ffmpeg-integration.sh` は、SHA-256 と version を固定した
-FFmpeg / ffprobe 8.1.2 を使い、libaom-av1 の 8 bit / 10 bit と
+`scripts/test-ffmpeg-integration.sh` は、パス上の FFmpeg / ffprobe を使い、
+libaom-av1 の 8 bit / 10 bit と
 normal / low-latency を別ケースで生成する。各 Bridge 出力から AV1
 elementary stream を抽出し、
 `scripts/verify-av1-ts-elementary-stream.sh` で次を byte 単位に検証する。
