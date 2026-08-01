@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: 0BSD
 
+# SBCL / CL FASL and compiler temps
 *.FASL
 *.fasl
 *.lisp-temp
@@ -17,4 +18,34 @@
 *.sx32fsl
 *.wx64fsl
 *.wx32fsl
+
+# Saved executables and native build products
+*.elf
+*.o
+*.so
+*.a
+*.dylib
+core
+core.*
+
+# Project build output directory
 build/
+
+# Local / agent temporary scripts and scratch files
+_tmp*
+**/_tmp*
+*.tmp
+*.temp
+*~
+\#*\#
+.\#*
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+*.swo
+
+# Local ASDF / cache dirs if created inside the tree
+.cache/
+.asdf/
+system-index.txt
