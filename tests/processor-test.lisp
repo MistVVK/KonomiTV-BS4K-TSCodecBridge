@@ -1258,10 +1258,9 @@
        (payload-continuity-valid-p
         output +test-video-pid+)))))
 
-(define-bridge-test av1-pusi-boundary-rejects-residual-without-carry
+(define-bridge-test av1-pusi-boundary-moves-next-pes-start-for-residual
   (multiple-value-bind (input expected intermediate-null-index)
       (make-av1-initial-interleaved-null-fixture)
-    (declare (ignore expected))
     (let* ((without-null
              (loop for packet in input
                    for index from 0
@@ -1270,68 +1269,86 @@
            (last-video
              (find +test-video-pid+ without-null
                    :key #'ts-pid :test #'= :from-end t))
-           (next-pusi
-             (first
-              (packetize-test-video-with-pcr
-               (make-pes
-                #xe0
-                (make-test-av1-access-unit 8)
-                180000)
-               :continuity-counter
-               (logand
-                (+ (ts-continuity-counter last-video) 1)
-                #x0f)
-               :discontinuity nil
-               :pcr-lead-ticks
-               +test-tstd-removal-delay-ticks+)))
+           (next-pes
+             (make-pes
+              #xe0
+              (make-test-av1-access-unit 8)
+              180000))
+           (next-video nil)
            (pusi-origin (length without-null))
-           (source
-             (retime-test-pcrs-for-cbr
-              (append
-               without-null
-               (list next-pusi
-                     (make-output-null-packet)))
-              +test-transport-rate-kbps+))
-           (output (make-instance 'octet-collector-stream))
-           (processor
-             (make-bridge-processor
-              output :av1 :aac
-              :transport-rate-kbps
-              +test-transport-rate-kbps+))
-           (message
-             (handler-case
-                 (progn
-                   (dolist (packet source)
-                     (process-bridge-packet
-                      processor (copy-seq packet)))
-                   nil)
-               (bridge-error (condition)
-                 (bridge-error-message condition))))
-           (pending-pusi
-             (loop for entry =
-                     (bridge-processor-pending-head processor)
-                       then (pending-entry-next entry)
-                   while entry
-                   when (= (pending-entry-slot-index entry)
-                           pusi-origin)
-                     return entry)))
+           (source-pusi nil)
+           (source nil)
+           (output nil)
+           (output-pusi-index nil)
+           (expected-next nil))
+      (setf (aref next-pes 4) 0
+            (aref next-pes 5) 0
+            next-video
+            (packetize-test-video-with-pcr
+             next-pes
+             :continuity-counter
+             (logand
+              (+ (ts-continuity-counter last-video) 1)
+              #x0f)
+             :discontinuity nil
+             :pcr-lead-ticks
+             +test-tstd-removal-delay-ticks+)
+            source
+            (retime-test-pcrs-for-cbr
+             (append
+              without-null
+              next-video
+              (list (make-output-null-packet)))
+             +test-transport-rate-kbps+)
+            source-pusi (nth pusi-origin source)
+            output
+            (run-packet-processor
+             source :av1 :aac :retime-p nil)
+            output-pusi-index
+            (position-if
+             (lambda (packet)
+               (and
+                (= (ts-pid packet) +test-video-pid+)
+                (ts-payload-unit-start-p packet)))
+             output :start (1+ pusi-origin)))
+      (let* ((header
+               (parse-pes-header next-pes))
+             (payload-offset
+               (pes-header-payload-offset header))
+             (expected-header
+               (copy-seq (subseq next-pes 0 payload-offset))))
+        (setf (aref expected-header 3) #xbd
+              (aref expected-header 6)
+              (logior (aref expected-header 6) #x04)
+              expected-next
+              (concatenate-octets
+               expected-header
+               (convert-av1-access-unit-to-ts-format
+                (subseq next-pes payload-offset)))))
       (check-bridge-test
-       (and message
-            (search
-             "REPACKETIZE_CAPACITY_EXHAUSTED residual_bytes="
-             message :test #'char=)))
-      ;; 旧PES残留は次PUSIやその後のnullへcarryせず、その場で拒否する。
-      (check-bridge-test pending-pusi)
-      (check-bridge-test
-       (= (pending-entry-slot-index pending-pusi)
-          pusi-origin))
+       (= (length output) (length source)))
       (check-bridge-test
        (equalp
-        (pending-entry-packet pending-pusi)
-        (nth pusi-origin source)))
+        (first-unbounded-pes-on-pid output +test-video-pid+)
+        expected))
+      ;; 元PUSI slotは旧PES末尾へ使い、次PES開始だけを後続slotへ移す。
       (check-bridge-test
-       (ts-payload-unit-start-p
-        (pending-entry-packet pending-pusi))))))
+       (not (ts-payload-unit-start-p (nth pusi-origin output))))
+      (check-bridge-test
+       (= (ts-pid (nth pusi-origin output)) +test-video-pid+))
+      (check-bridge-test
+       (= (ts-pcr (nth pusi-origin output))
+          (ts-pcr source-pusi)))
+      (check-bridge-test output-pusi-index)
+      (check-bridge-test (> output-pusi-index pusi-origin))
+      (check-bridge-test
+       (equalp
+        (first-unbounded-pes-on-pid
+         (subseq output output-pusi-index)
+         +test-video-pid+)
+        expected-next))
+      (check-bridge-test
+       (payload-continuity-valid-p output +test-video-pid+)))))
 
 (define-bridge-test av1-eof-boundary-rejects-residual-without-carry
   (multiple-value-bind (input expected intermediate-null-index)

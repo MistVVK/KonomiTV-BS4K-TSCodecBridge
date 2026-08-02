@@ -38,6 +38,9 @@
   (use-original-p t :type boolean)
   (replacements '() :type list)
   (replacement-provenances '() :type list)
+  ;; 直前AV1 PESの末尾を収容するため、このsource packetの出力slotを
+  ;; 使用済みなら真。source payload自体は次PESとして通常どおり解析する。
+  (av1-output-target-consumed-p nil :type boolean)
   (event nil)
   (next nil))
 
@@ -3132,7 +3135,18 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
           while cursor
           do
       (cond
-        ((member cursor entries :test #'eq)
+        ((and
+          (member cursor entries :test #'eq)
+          (pending-entry-av1-output-target-consumed-p cursor))
+         ;; 出力slotは旧PESが使用済みでも、後続nullを新PESのtargetへ
+         ;; 変換するためのPID・priority・CC templateには利用できる。
+         (setf
+          (pes-assembler-av1-stream-last-template assembler)
+          (pending-entry-packet cursor)))
+        ((and
+          (member cursor entries :test #'eq)
+          (not
+           (pending-entry-av1-output-target-consumed-p cursor)))
          (enqueue-av1-stream-target-entry
           assembler cursor :kind :video))
         ((and
@@ -3146,6 +3160,33 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
       (when (eq cursor last-entry)
         (return))))
   assembler)
+
+(defun queued-av1-stream-target-capacity (assembler)
+  "現在queue済みのAV1 targetが収容できる合計byte数を返す。"
+  (loop for target =
+          (pes-assembler-av1-stream-target-head assembler)
+            then (av1-stream-target-entry-next target)
+        while target
+        sum (av1-stream-target-payload-capacity assembler target)))
+
+(defun maybe-borrow-next-av1-pusi-target
+    (processor assembler entry packet)
+  "旧AV1 PESの末尾不足時だけ次PUSIのslotを継続packetとして借りる。
+
+PUSIのsource payloadは次PESとして解析し、実際のPUSI出力は後続の
+video/null targetへ移す。選択PCRを含むadaptation fieldは元slotに残す。"
+  (unless (and
+           (eq (bridge-processor-video-codec processor) :av1)
+           (pes-assembler-streaming-p assembler)
+           (ts-payload-unit-start-p packet)
+           (not (ts-discontinuity-indicator-p packet))
+           (> (pes-assembler-av1-stream-byte-count assembler)
+              (queued-av1-stream-target-capacity assembler)))
+    (return-from maybe-borrow-next-av1-pusi-target nil))
+  (mark-entry-unresolved entry)
+  (setf (pending-entry-av1-output-target-consumed-p entry) t)
+  (enqueue-av1-stream-target-entry assembler entry :kind :video)
+  t)
 
 (defun resolve-initial-av1-stream-entries
     (processor assembler entries transformer payload-offset
@@ -3816,44 +3857,49 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
 (defun process-target-pes-packet
     (processor assembler entry packet)
   "対象PIDのPACKETをPES単位で検証・保留する。"
-  (validate-target-transport-packet assembler packet)
-  (unless (validate-pes-transport-continuity assembler packet)
-    (resolve-entry entry '())
-    (return-from process-target-pes-packet nil))
-  (when (and (ts-payload-unit-start-p packet)
-             (pes-assembler-active-p assembler))
-    (finish-pes-event processor assembler))
-  (cond
-    ((ts-payload-unit-start-p packet)
-     (unless (ts-has-payload-p packet)
-       (bridge-error "PES start packet has no payload"))
-     (start-pes-event processor assembler))
-    ((not (pes-assembler-active-p assembler))
-     (if (ts-has-payload-p packet)
-         (bridge-error
-          "PES payload arrives without PUSI on PID 0x~4,'0X"
-          (pes-assembler-pid assembler))
-         (return-from process-target-pes-packet nil))))
-  (mark-entry-unresolved entry)
-  (push entry (pes-assembler-entries assembler))
-  (when (ts-has-payload-p packet)
-    (append-pes-octets assembler packet)
-    (maybe-record-program-timestamp processor assembler)
+  (let ((output-target-consumed-p nil))
+    (validate-target-transport-packet assembler packet)
+    (unless (validate-pes-transport-continuity assembler packet)
+      (resolve-entry entry '())
+      (return-from process-target-pes-packet nil))
+    (when (and (ts-payload-unit-start-p packet)
+               (pes-assembler-active-p assembler))
+      (setf output-target-consumed-p
+            (maybe-borrow-next-av1-pusi-target
+             processor assembler entry packet))
+      (finish-pes-event processor assembler))
     (cond
-      ((pes-assembler-streaming-p assembler)
-       (resolve-active-streaming-video-entry
-        processor assembler entry packet))
-      ((or (try-start-vp9-streaming processor assembler)
-           (try-start-av1-streaming processor assembler))
-       nil)
-      ((declared-pes-complete-p assembler)
-       (trim-complete-pes-buffer assembler)
-       (finish-pes-event processor assembler))))
-  (when (and (not (ts-has-payload-p packet))
-             (pes-assembler-streaming-p assembler))
-    (resolve-active-streaming-video-entry
-     processor assembler entry packet))
-  t)
+      ((ts-payload-unit-start-p packet)
+       (unless (ts-has-payload-p packet)
+         (bridge-error "PES start packet has no payload"))
+       (start-pes-event processor assembler))
+      ((not (pes-assembler-active-p assembler))
+       (if (ts-has-payload-p packet)
+           (bridge-error
+            "PES payload arrives without PUSI on PID 0x~4,'0X"
+            (pes-assembler-pid assembler))
+           (return-from process-target-pes-packet nil))))
+    (unless output-target-consumed-p
+      (mark-entry-unresolved entry))
+    (push entry (pes-assembler-entries assembler))
+    (when (ts-has-payload-p packet)
+      (append-pes-octets assembler packet)
+      (maybe-record-program-timestamp processor assembler)
+      (cond
+        ((pes-assembler-streaming-p assembler)
+         (resolve-active-streaming-video-entry
+          processor assembler entry packet))
+        ((or (try-start-vp9-streaming processor assembler)
+             (try-start-av1-streaming processor assembler))
+         nil)
+        ((declared-pes-complete-p assembler)
+         (trim-complete-pes-buffer assembler)
+         (finish-pes-event processor assembler))))
+    (when (and (not (ts-has-payload-p packet))
+               (pes-assembler-streaming-p assembler))
+      (resolve-active-streaming-video-entry
+       processor assembler entry packet))
+    t))
 
 (defun process-bridge-packet (processor packet)
   "厳格検証済みTS PACKETをsemantic processorへ1個与える。"

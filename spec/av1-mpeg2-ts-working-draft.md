@@ -190,8 +190,13 @@ packet slot では、FIFO 先頭の deadline を超えていないことを検�
   PMT 前置などにより packet FIFO へ入る場合も、収録した最古 byte segment
   の origin slot と deadline slot を保持する。FIFO へ入れ直した slot を
   新しい origin として deadline を更新してはならない。
-- 次の映像 PUSI または EOF に AV1 byte が残る場合は、次の PES へ跨がせず
-  `REPACKETIZE_CAPACITY_EXHAUSTED` で fail closed にする。
+- 次の映像 PUSI に AV1 byte が残る場合は、その PUSI packet の slot と
+  選択 PCR を維持したまま旧 PES の continuation target として使える。
+  source payload は次 PES として通常どおり解析し、実際の PUSI と random
+  access indication は同じ PES の後続 video/null target へ移す。旧 PES と
+  次 PES の byte を同一 TS payload に混在させない。次 PUSI target を使っても
+  旧 PES の残留を収容できない場合、discontinuity 境界の場合、または EOF に
+  AV1 byte が残る場合は `REPACKETIZE_CAPACITY_EXHAUSTED` で fail closed にする。
 - 縮小で空いた対象 PID slot は null packet で埋める。
 - continuity counter は、元 template、null continuation の別によらず、
   実際に映像 payload を出力した packet ごとにだけ増分する。
