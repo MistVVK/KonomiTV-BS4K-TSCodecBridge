@@ -13,6 +13,13 @@
 ;; 規格上 PCR は 100ms 以内だが、FFmpeg live + 固定 muxrate では 29.97fps で
 ;; 数 frame 分 PCR 無しが連続することがあるため 500ms を許す。
 (defconstant +maximum-pcr-gap-pts-ticks+ 45000)
+;; 30000/1001 fps の 1 frame は 3003 ticks で、15 frame 端は
+;; 45045 ticks に量子化される。500ms の意味を広げず、この端数差
+;; 45 ticks だけを明示的に許容する。
+(defconstant +pcr-gap-ntsc-frame-quantization-tolerance-ticks+ 45)
+(defconstant +maximum-quantized-pcr-gap-pts-ticks+
+  (+ +maximum-pcr-gap-pts-ticks+
+     +pcr-gap-ntsc-frame-quantization-tolerance-ticks+))
 (defconstant +maximum-dts-pcr-delay-ticks+ 900000)
 ;; FFmpeg の低遅延 mux では起動直後に DTS が PCR より数百 ms 先行することがある。
 ;; 2 秒以内の先行は許容し、それ以上だけを致命とする。
@@ -370,12 +377,17 @@
          (setf
           (pes-assembler-pcr-window-start-timestamp assembler)
           unwrapped))
-        ((> (- unwrapped window-start)
-            +maximum-pcr-gap-pts-ticks+)
-         (bridge-error
-          "SELECTED_PCR_GAP elapsed_90khz_ticks=~D limit_ticks=~D"
-          (- unwrapped window-start)
-          +maximum-pcr-gap-pts-ticks+))))
+        (t
+         (let ((elapsed (- unwrapped window-start)))
+           ;; 500ms超を連続範囲として緩和しない。30000/1001fps の
+           ;; 15 frame 端で実際に生じる 45045 ticks だけを追加で受理する。
+           (when (and (> elapsed +maximum-pcr-gap-pts-ticks+)
+                      (/= elapsed +maximum-quantized-pcr-gap-pts-ticks+))
+             (bridge-error
+              "SELECTED_PCR_GAP elapsed_90khz_ticks=~D limit_ticks=~D accepted_ntsc_quantized_boundary_ticks=~D"
+              elapsed
+              +maximum-pcr-gap-pts-ticks+
+              +maximum-quantized-pcr-gap-pts-ticks+))))))
     unwrapped))
 
 (defun restart-pcr-gap-windows (processor)

@@ -52,6 +52,7 @@
 
 (defstruct stream-anchor-video-point
   (pts 0 :type (unsigned-byte 33))
+  (dts nil :type (or null (unsigned-byte 33)))
   (unwrapped-pts 0 :type integer))
 
 (defstruct stream-anchor-marker
@@ -112,6 +113,10 @@
   (pmt-pid nil :type (or null (unsigned-byte 13)))
   (program-number nil :type (or null (unsigned-byte 16)))
   (video-pid nil :type (or null (unsigned-byte 13)))
+  (video-codec nil
+               :type
+               (or null
+                   (member :mpeg1 :mpeg2 :avc :hevc :vp9 :av1)))
   (timed-id3-pids '() :type list)
   (id3-assemblers (make-hash-table :test #'eql)
                   :type hash-table)
@@ -462,21 +467,47 @@ source ownerを含まないID3はNILを返し、他ownerの内容には介入し
            (setf (stream-anchor-finalizer-pending-tail finalizer) nil))))
   nil)
 
-(defun stream-anchor-video-registration-p (stream)
-  "STREAMがBridgeのVP9/AV1 mappingを示すか返す。"
-  (some
-   (lambda (descriptor)
-     (or (vp9-registration-descriptor-p descriptor)
-         (av1-registration-descriptor-p descriptor)))
-   (pmt-stream-descriptors stream)))
+(defun stream-anchor-private-video-codec (stream)
+  "STREAMのBridge private mappingから映像codecを一意に返す。"
+  (let ((vp9-p
+          (some #'vp9-registration-descriptor-p
+                (pmt-stream-descriptors stream)))
+        (av1-p
+          (some #'av1-registration-descriptor-p
+                (pmt-stream-descriptors stream))))
+    (when (and vp9-p av1-p)
+      (bridge-error "STREAM_ANCHOR_VIDEO_CODEC_AMBIGUOUS"))
+    (cond
+      (vp9-p :vp9)
+      (av1-p :av1)
+      (t nil))))
+
+(defun stream-anchor-video-codec (stream)
+  "STREAMのPMT stream type/mappingからAnchor対象codecを返す。"
+  (case (pmt-stream-stream-type stream)
+    (#x01 :mpeg1)
+    (#x02 :mpeg2)
+    (#x1b :avc)
+    (#x24 :hevc)
+    (#x06 (stream-anchor-private-video-codec stream))
+    (otherwise nil)))
 
 (defun stream-anchor-video-stream-p (stream)
   "STREAMがAnchor対象の標準/Bridge映像ESなら真を返す。"
-  (or (member (pmt-stream-stream-type stream)
-              '(#x01 #x02 #x1b #x24)
-              :test #'=)
-      (and (= (pmt-stream-stream-type stream) #x06)
-           (stream-anchor-video-registration-p stream))))
+  (not (null (stream-anchor-video-codec stream))))
+
+(defun reset-stream-anchor-video-epoch (finalizer)
+  "FINALIZERの旧映像stream epochに属する状態を初期化する。"
+  (setf
+   (stream-anchor-finalizer-video-header-state finalizer)
+   (make-stream-anchor-video-header-state)
+   (stream-anchor-finalizer-video-points finalizer) '()
+   (stream-anchor-finalizer-last-video-ordering-timestamp finalizer) nil
+   (stream-anchor-finalizer-last-video-unwrapped-ordering-timestamp
+    finalizer)
+   nil
+   (stream-anchor-finalizer-seen-video-p finalizer) nil)
+  finalizer)
 
 (defun select-stream-anchor-program (finalizer table)
   "PATからFINALIZERが追跡するprogramを一意に選ぶ。"
@@ -540,6 +571,7 @@ source ownerを含まないID3はNILを返し、他ownerの内容には介入し
         (when (stream-anchor-finalizer-pending-markers finalizer)
           (bridge-error
            "STREAM_ANCHOR_PAT_CHANGE_WITH_PENDING_MARKER"))
+        (reset-stream-anchor-video-epoch finalizer)
         (setf
          (stream-anchor-finalizer-pmt-pid finalizer) pmt-pid
          (stream-anchor-finalizer-program-number finalizer)
@@ -547,6 +579,7 @@ source ownerを含まないID3はNILを返し、他ownerの内容には介入し
          (stream-anchor-finalizer-pmt-assembler finalizer)
          (make-section-assembler pmt-pid)
          (stream-anchor-finalizer-video-pid finalizer) nil
+         (stream-anchor-finalizer-video-codec finalizer) nil
          (stream-anchor-finalizer-timed-id3-pids finalizer) '()
          (stream-anchor-finalizer-id3-assemblers finalizer)
          (make-hash-table :test #'eql)
@@ -577,17 +610,37 @@ source ownerを含まないID3はNILを返し、他ownerの内容には介入し
        (length video-streams)))
     (when (null timed-id3-pids)
       (bridge-error "STREAM_ANCHOR_TIMED_ID3_STREAM_MISSING"))
-    (let ((video-pid
-            (pmt-stream-elementary-pid (first video-streams))))
+    (let* ((video-stream (first video-streams))
+           (video-pid
+             (pmt-stream-elementary-pid video-stream))
+           (video-codec
+             (stream-anchor-video-codec video-stream))
+           (video-pid-changed-p
+             (and
+              (stream-anchor-finalizer-video-pid finalizer)
+              (/= video-pid
+                  (stream-anchor-finalizer-video-pid finalizer))))
+           (video-codec-changed-p
+             (and
+              (stream-anchor-finalizer-video-codec finalizer)
+              (not
+               (eq video-codec
+                   (stream-anchor-finalizer-video-codec finalizer))))))
       (when
-          (and (stream-anchor-finalizer-video-pid finalizer)
-               (/= video-pid
-                   (stream-anchor-finalizer-video-pid finalizer))
+          (and video-pid-changed-p
                (stream-anchor-finalizer-pending-markers finalizer))
         (bridge-error
          "STREAM_ANCHOR_VIDEO_PID_CHANGE_WITH_PENDING_MARKER"))
+      (when
+          (and video-codec-changed-p
+               (stream-anchor-finalizer-pending-markers finalizer))
+        (bridge-error
+         "STREAM_ANCHOR_VIDEO_CODEC_CHANGE_WITH_PENDING_MARKER"))
+      (when (or video-pid-changed-p video-codec-changed-p)
+        (reset-stream-anchor-video-epoch finalizer))
       (setf
        (stream-anchor-finalizer-video-pid finalizer) video-pid
+       (stream-anchor-finalizer-video-codec finalizer) video-codec
        (stream-anchor-finalizer-timed-id3-pids finalizer)
        timed-id3-pids
        (stream-anchor-finalizer-seen-pmt-p finalizer) t))))
@@ -756,26 +809,99 @@ source ownerを含まないID3はNILを返し、他ownerの内容には介入し
         (and (= (abs candidate-delta) (abs current-delta))
              (< candidate-delta current-delta)))))
 
+(defun choose-nearest-stream-anchor-video-point (finalizer marker)
+  "MARKERに最も近いvideo pointを距離上限なしで返す。"
+  (let ((best nil)
+        (marker-unwrapped
+          (stream-anchor-marker-unwrapped-pts marker)))
+    (when marker-unwrapped
+      (dolist (point (stream-anchor-finalizer-video-points finalizer))
+        (when (or (null best)
+                  (stream-anchor-point-better-p
+                   point best marker-unwrapped))
+          (setf best point))))
+    best))
+
 (defun choose-stream-anchor-video-point (finalizer marker)
   "MARKERに最も近い上限内のvideo pointを返す。"
-  (let ((best nil)
+  (let ((point
+          (choose-nearest-stream-anchor-video-point
+           finalizer marker))
         (marker-unwrapped
           (stream-anchor-marker-unwrapped-pts marker))
         (limit
           (stream-anchor-finalizer-maximum-distance-ticks
            finalizer)))
-    (dolist (point (stream-anchor-finalizer-video-points finalizer))
-      (let ((distance
-              (abs
-               (- (stream-anchor-video-point-unwrapped-pts point)
-                  marker-unwrapped))))
-        (when (and
-               (<= distance limit)
-               (or (null best)
-                   (stream-anchor-point-better-p
-                    point best marker-unwrapped)))
-          (setf best point))))
-    best))
+    (when (and point marker-unwrapped
+               (<=
+                (abs
+                 (- (stream-anchor-video-point-unwrapped-pts point)
+                    marker-unwrapped))
+                limit))
+      point)))
+
+(defun stream-anchor-video-cadence-summary (finalizer)
+  "保持中video PTSの正の隣接差をminimum/maximum/sample数で返す。"
+  (let ((timestamps
+          (sort
+           (remove-duplicates
+            (mapcar
+             #'stream-anchor-video-point-unwrapped-pts
+             (stream-anchor-finalizer-video-points finalizer))
+            :test #'=)
+           #'<))
+        (minimum nil)
+        (maximum nil)
+        (sample-count 0))
+    (loop for current on timestamps
+          for next = (second current)
+          while next
+          for delta = (- next (first current))
+          when (plusp delta)
+            do
+               (setf minimum (if minimum (min minimum delta) delta)
+                     maximum (if maximum (max maximum delta) delta))
+               (incf sample-count))
+    (values minimum maximum sample-count)))
+
+(defun signal-stream-anchor-video-match-exceeded
+    (finalizer marker limit)
+  "MARKERと最近AU/cadenceを記録して距離超過を通知する。"
+  (let* ((source (stream-anchor-marker-source marker))
+         (marker-unwrapped
+           (stream-anchor-marker-unwrapped-pts marker))
+         (nearest
+           (choose-nearest-stream-anchor-video-point
+            finalizer marker))
+         (nearest-unwrapped
+           (and nearest
+                (stream-anchor-video-point-unwrapped-pts nearest)))
+         (nearest-delta
+           (and nearest-unwrapped marker-unwrapped
+                (- nearest-unwrapped marker-unwrapped))))
+    (multiple-value-bind
+          (cadence-min cadence-max cadence-samples)
+        (stream-anchor-video-cadence-summary finalizer)
+      (bridge-error
+       "STREAM_ANCHOR_VIDEO_MATCH_EXCEEDED generation=~D sequence=~D codec=~(~A~) marker_pts=~D marker_unwrapped_pts=~A nearest_au_pts=~A nearest_au_dts=~A nearest_delta_ticks=~A nearest_distance_ticks=~A cadence_min_ticks=~A cadence_max_ticks=~A cadence_samples=~D limit_ticks=~D"
+       (stream-anchor-source-generation-id source)
+       (stream-anchor-source-sequence source)
+       (or (stream-anchor-finalizer-video-codec finalizer)
+           :unknown)
+       (stream-anchor-marker-pts marker)
+       (or marker-unwrapped "none")
+       (if nearest
+           (stream-anchor-video-point-pts nearest)
+           "none")
+       (or (and nearest
+                (stream-anchor-video-point-dts nearest))
+           "none")
+       (or nearest-delta "none")
+       (or (and nearest-delta (abs nearest-delta)) "none")
+       (or cadence-min "none")
+       (or cadence-max "none")
+       cadence-samples
+       limit))))
 
 (defun assign-stream-anchor-marker-epoch (finalizer marker)
   "MARKERの33 bit PTSを現在のvideo ordering epochへ展開する。"
@@ -828,13 +954,8 @@ source ownerを含まないID3はNILを返し、他ownerの内容には介入し
           ((and ready-p point)
            (finalize-stream-anchor-marker marker point))
           (ready-p
-           (bridge-error
-            "STREAM_ANCHOR_VIDEO_MATCH_EXCEEDED generation=~D sequence=~D limit_ticks=~D"
-            (stream-anchor-source-generation-id
-             (stream-anchor-marker-source marker))
-            (stream-anchor-source-sequence
-             (stream-anchor-marker-source marker))
-            limit))
+           (signal-stream-anchor-video-match-exceeded
+            finalizer marker limit))
           (t
            (push marker remaining)))))
     (setf (stream-anchor-finalizer-pending-markers finalizer)
@@ -901,6 +1022,7 @@ source ownerを含まないID3はNILを返し、他ownerの内容には介入し
        (cons
         (make-stream-anchor-video-point
          :pts pts
+         :dts (pes-header-dts header)
          :unwrapped-pts pts-unwrapped)
         (stream-anchor-finalizer-video-points finalizer))
        (stream-anchor-finalizer-seen-video-p finalizer) t)

@@ -1408,7 +1408,7 @@
       (lambda ()
         (validate-program-timestamp-against-pcr
          processor assembler
-         (+ 90000 +maximum-pcr-gap-pts-ticks+ 1)
+         (+ 90000 +maximum-quantized-pcr-gap-pts-ticks+ 1)
          t))
       "SELECTED_PCR_GAP"))))
 
@@ -1563,8 +1563,9 @@
             +test-video-pid+
             (make-pes
              #xbd (make-test-vp9-key-frame 0 320 180)
-             (+ 90000 +maximum-pcr-gap-pts-ticks+ 1)
-             :dts (+ 90000 +maximum-pcr-gap-pts-ticks+ 1))
+             (+ 90000 +maximum-quantized-pcr-gap-pts-ticks+ 1)
+             :dts
+             (+ 90000 +maximum-quantized-pcr-gap-pts-ticks+ 1))
             :continuity-counter
             (logand (length first) #x0f)
             :payload-unit-start t)))
@@ -1596,6 +1597,48 @@
          (+ +maximum-dts-pcr-delay-ticks+ 1)
          t))
       "DTS_PCR_DELAY_EXCEEDED"))))
+
+(define-bridge-test selected-pcr-gap-accepts-only-ntsc-quantized-boundary
+  (let ((processor
+          (make-bridge-processor
+           (make-instance 'octet-collector-stream)
+           :passthrough :aac))
+        (assembler
+          (%make-pes-assembler +test-video-pid+ :video)))
+    ;; 500msを丸めで広げない。30000/1001fpsの15 frame端だけが45045 ticksになる。
+    (check-bridge-test (= +maximum-pcr-gap-pts-ticks+ 45000))
+    (check-bridge-test
+     (= +pcr-gap-ntsc-frame-quantization-tolerance-ticks+ 45))
+    (check-bridge-test
+     (= +maximum-quantized-pcr-gap-pts-ticks+ 45045))
+    (validate-program-timestamp-against-pcr
+     processor assembler 90000 t)
+    (dolist (elapsed '(45001 45044))
+      (check-bridge-test
+       (bridge-error-message-contains-p
+        (lambda ()
+          (validate-program-timestamp-against-pcr
+           processor assembler
+           (+ 90000 elapsed)
+           t))
+        (format nil
+                "SELECTED_PCR_GAP elapsed_90khz_ticks=~D limit_ticks=45000 accepted_ntsc_quantized_boundary_ticks=45045"
+                elapsed))))
+    (check-bridge-test
+     (=
+      (validate-program-timestamp-against-pcr
+       processor assembler
+       (+ 90000 +maximum-quantized-pcr-gap-pts-ticks+)
+       t)
+      +maximum-quantized-pcr-gap-pts-ticks+))
+    (check-bridge-test
+     (bridge-error-message-contains-p
+      (lambda ()
+        (validate-program-timestamp-against-pcr
+         processor assembler
+         (+ 90000 +maximum-quantized-pcr-gap-pts-ticks+ 1)
+         t))
+      "SELECTED_PCR_GAP elapsed_90khz_ticks=45046 limit_ticks=45000 accepted_ntsc_quantized_boundary_ticks=45045"))))
 
 (define-bridge-test opus-clock-detects-pcr-gap-while-video-stalls
   (let* ((processor

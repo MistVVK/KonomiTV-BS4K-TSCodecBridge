@@ -2,17 +2,22 @@
 
 (in-package #:konomitv-bs4k-tscodecbridge)
 
-(defun make-test-stream-anchor-pmt-table ()
-  "標準AVCとtimed-ID3を持つAnchor fixture PMTを作る。"
+(defun make-test-stream-anchor-pmt-table
+    (&key (version 3)
+      (video-stream-type #x1b)
+      (video-pid +test-video-pid+)
+      (video-descriptors '()))
+  "VIDEO-STREAM-TYPE映像とtimed-ID3を持つAnchor fixture PMTを作る。"
   (make-program-map-table
    :program-number 1
-   :version 3
-   :pcr-pid +test-video-pid+
+   :version version
+   :pcr-pid video-pid
    :streams
    (list
     (make-pmt-stream
-     :stream-type #x1b
-     :elementary-pid +test-video-pid+)
+     :stream-type video-stream-type
+     :elementary-pid video-pid
+     :descriptors video-descriptors)
     (make-pmt-stream
      :stream-type #x0f
      :elementary-pid +test-audio-one-pid+)
@@ -23,13 +28,22 @@
      :stream-type #x0d
      :elementary-pid +test-data-pid+))))
 
-(defun make-test-stream-anchor-pmt-packets ()
+(defun make-test-stream-anchor-pmt-packets
+    (&key (continuity-counter 4)
+      (version 3)
+      (video-stream-type #x1b)
+      (video-pid +test-video-pid+)
+      (video-descriptors '()))
   "Anchor fixture PMTをTS packet列へする。"
   (make-section-ts-packets
    +test-pmt-pid+
    (build-pmt-section
-    (make-test-stream-anchor-pmt-table))
-   4))
+    (make-test-stream-anchor-pmt-table
+     :version version
+     :video-stream-type video-stream-type
+     :video-pid video-pid
+     :video-descriptors video-descriptors))
+   continuity-counter))
 
 (defun make-test-id3-frame (identifier payload)
   "ID3v2.4の単純なFRAMEを作る。"
@@ -118,16 +132,24 @@
    :payload-unit-start t))
 
 (defun packetize-test-anchor-video
-    (pts continuity-counter &key dts)
+    (pts continuity-counter &key dts (pid +test-video-pid+))
   "小さい標準video PESをpacketizeする。"
   (packetize-payload
-   +test-video-pid+
+   pid
    (make-pes
     #xe0
     (make-pattern-octets 29 (logand pts #xff))
     pts
     :dts dts)
    :continuity-counter continuity-counter
+   :payload-unit-start t))
+
+(defun make-test-partial-anchor-video-header
+    (continuity-counter &key (pid +test-video-pid+))
+  "次のPMTまで未完の映像PES headerを作る。"
+  (make-ts-packet
+   pid continuity-counter
+   (octets #x00 #x00 #x01 #xe0)
    :payload-unit-start t))
 
 (defun run-stream-anchor-finalizer-test
@@ -206,33 +228,21 @@
        (read-stream-anchor-u64 id3 (+ payload-start 16))
        id3))))
 
-(defun make-test-stream-anchor-prefix ()
+(defun make-test-stream-anchor-prefix
+    (&key (video-stream-type #x1b))
   "Anchor fixtureのPAT/PMT packet列を返す。"
   (append
    (make-test-pat-packets)
-   (make-test-stream-anchor-pmt-packets)))
+   (make-test-stream-anchor-pmt-packets
+    :video-stream-type video-stream-type)))
 
 (defun make-test-mapped-stream-anchor-prefix (descriptors)
   "Bridge private映像mappingを持つAnchor fixtureのPAT/PMTを作る。"
   (append
    (make-test-pat-packets)
-   (make-section-ts-packets
-    +test-pmt-pid+
-    (build-pmt-section
-     (make-program-map-table
-      :program-number 1
-      :version 3
-      :pcr-pid +test-video-pid+
-      :streams
-      (list
-       (make-pmt-stream
-        :stream-type #x06
-        :elementary-pid +test-video-pid+
-        :descriptors descriptors)
-       (make-pmt-stream
-        :stream-type #x15
-        :elementary-pid +test-timed-id3-pid+))))
-    4)))
+   (make-test-stream-anchor-pmt-packets
+    :video-stream-type #x06
+    :video-descriptors descriptors)))
 
 (define-bridge-test stream-anchor-exact-match-finalizes-owner-and-pts
   (let* ((input-anchor
@@ -278,6 +288,201 @@
       (check-bridge-test (= generation 8))
       (check-bridge-test (= sequence 10))
       (check-bridge-test (= source-time 499000)))))
+
+(define-bridge-test stream-anchor-hevc-24000-1001-cadence-keeps-nearest-bound
+  (let* ((output
+           (run-stream-anchor-finalizer-test
+            (append
+             (make-test-stream-anchor-prefix
+              :video-stream-type #x24)
+             ;; 90000 * 1001 / 24000 = 3753.75 ticks/frame。
+             ;; 90kHzへの量子化は 3754/3753 ticks を交互に含む。
+             (packetize-test-anchor-video
+              90000 0 :dts 82492)
+             (packetize-test-anchor-video
+              93754 1 :dts 86246)
+             (packetize-test-stream-anchor
+              95631 81 1 500000)
+             (packetize-test-anchor-video
+              97508 2 :dts 90000)
+             (packetize-test-anchor-video
+              101261 3 :dts 93753))))
+         (pes
+           (first
+           (all-declared-pes-on-pid
+             output +test-timed-id3-pid+))))
+    (multiple-value-bind
+          (pts generation sequence source-time)
+        (test-stream-anchor-fields pes)
+      (check-bridge-test
+       (= +stream-anchor-default-maximum-distance-ticks+ 4500))
+      ;; 同距離 1877 ticksの過去側AUを従来契約どおり優先する。
+      (check-bridge-test (= pts 93754))
+      (check-bridge-test (= generation 81))
+      (check-bridge-test (= sequence 1))
+      (check-bridge-test (= source-time 498123)))))
+
+(define-bridge-test stream-anchor-hevc-distance-error-reports-au-cadence
+  (let ((message
+          (handler-case
+              (progn
+                (run-stream-anchor-finalizer-test
+                 (append
+                  (make-test-stream-anchor-prefix
+                   :video-stream-type #x24)
+                  (packetize-test-anchor-video
+                   90000 0 :dts 82492)
+                  (packetize-test-anchor-video
+                   93754 1 :dts 86246)
+                  (packetize-test-anchor-video
+                   97508 2 :dts 90000)
+                  (packetize-test-anchor-video
+                   101261 3 :dts 93753)
+                  (packetize-test-stream-anchor
+                   82500 82 3 600000)))
+                nil)
+            (bridge-error (condition)
+              (bridge-error-message condition)))))
+    (check-bridge-test message)
+    (dolist
+        (field
+         '("STREAM_ANCHOR_VIDEO_MATCH_EXCEEDED"
+           "generation=82"
+           "sequence=3"
+           "codec=hevc"
+           "marker_pts=82500"
+           "nearest_au_pts=90000"
+           "nearest_au_dts=82492"
+           "nearest_delta_ticks=7500"
+           "nearest_distance_ticks=7500"
+           "cadence_min_ticks=3753"
+           "cadence_max_ticks=3754"
+           "cadence_samples=3"
+           "limit_ticks=4500"))
+      (check-bridge-test (search field message :test #'char=)))))
+
+(define-bridge-test stream-anchor-avc-to-hevc-starts-new-video-epoch
+  (let* ((output
+           (run-stream-anchor-finalizer-test
+            (append
+             (make-test-stream-anchor-prefix)
+             (packetize-test-anchor-video 90000 0)
+             (packetize-test-anchor-video 93754 1)
+             (list (make-test-partial-anchor-video-header 2))
+             (make-test-stream-anchor-pmt-packets
+              :continuity-counter 5
+              :version 4
+              :video-stream-type #x24)
+             (packetize-test-stream-anchor
+              90000 83 1 500000)
+             (packetize-test-anchor-video 93000 3))))
+         (pes
+           (first
+            (all-declared-pes-on-pid
+             output +test-timed-id3-pid+))))
+    (multiple-value-bind
+          (pts generation sequence source-time)
+        (test-stream-anchor-fields pes)
+      ;; 旧AVCのexact 90000ではなく、新HEVC epochのAUを選ぶ。
+      (check-bridge-test (= pts 93000))
+      (check-bridge-test (= generation 83))
+      (check-bridge-test (= sequence 1))
+      (check-bridge-test (= source-time 503000)))))
+
+(define-bridge-test stream-anchor-video-pid-change-starts-new-video-epoch
+  (let* ((output
+           (run-stream-anchor-finalizer-test
+            (append
+             (make-test-stream-anchor-prefix)
+             (packetize-test-anchor-video 90000 0)
+             (packetize-test-anchor-video 93754 1)
+             (make-test-stream-anchor-pmt-packets
+              :continuity-counter 5
+              :version 4
+              :video-pid +test-subtitle-pid+)
+             (packetize-test-stream-anchor
+              90000 84 1 600000)
+             (packetize-test-anchor-video
+              93000 0 :pid +test-subtitle-pid+))))
+         (pes
+           (first
+            (all-declared-pes-on-pid
+             output +test-timed-id3-pid+))))
+    (multiple-value-bind
+          (pts generation sequence source-time)
+        (test-stream-anchor-fields pes)
+      (check-bridge-test (= pts 93000))
+      (check-bridge-test (= generation 84))
+      (check-bridge-test (= sequence 1))
+      (check-bridge-test (= source-time 603000)))))
+
+(define-bridge-test stream-anchor-vp9-to-av1-isolates-cadence-history
+  (let* ((configuration
+           (make-av1-codec-configuration :level 8))
+         (message
+           (handler-case
+               (progn
+                 (run-stream-anchor-finalizer-test
+                  (append
+                   (make-test-mapped-stream-anchor-prefix
+                    (make-vp9-mapping-descriptors))
+                   (packetize-test-anchor-video 90000 0)
+                   (packetize-test-anchor-video 93754 1)
+                   (make-test-stream-anchor-pmt-packets
+                    :continuity-counter 5
+                    :version 4
+                    :video-stream-type #x06
+                    :video-descriptors
+                    (make-av1-mapping-descriptors configuration))
+                   (packetize-test-anchor-video 100000 2)
+                   (packetize-test-anchor-video 106246 3)
+                   (packetize-test-stream-anchor
+                    120000 85 1 700000)))
+                 nil)
+             (bridge-error (condition)
+               (bridge-error-message condition)))))
+    (check-bridge-test message)
+    (dolist
+        (field
+         '("STREAM_ANCHOR_VIDEO_MATCH_EXCEEDED"
+           "codec=av1"
+           "nearest_au_pts=106246"
+           "nearest_delta_ticks=-13754"
+           "cadence_min_ticks=6246"
+           "cadence_max_ticks=6246"
+           "cadence_samples=1"))
+      (check-bridge-test (search field message :test #'char=)))))
+
+(define-bridge-test stream-anchor-video-change-with-marker-fails-closed
+  (dolist
+      (entry
+       (list
+        (list
+         "STREAM_ANCHOR_VIDEO_CODEC_CHANGE_WITH_PENDING_MARKER"
+         (list :video-stream-type #x24))
+        (list
+         "STREAM_ANCHOR_VIDEO_PID_CHANGE_WITH_PENDING_MARKER"
+         (list :video-pid +test-subtitle-pid+))))
+    (destructuring-bind (expected arguments) entry
+      (let ((message
+              (handler-case
+                  (progn
+                    (run-stream-anchor-finalizer-test
+                     (append
+                      (make-test-stream-anchor-prefix)
+                      (packetize-test-stream-anchor
+                       90000 86 1 800000)
+                      (apply
+                       #'make-test-stream-anchor-pmt-packets
+                       :continuity-counter 5
+                       :version 4
+                       arguments)))
+                    nil)
+                (bridge-error (condition)
+                  (bridge-error-message condition)))))
+        (check-bridge-test message)
+        (check-bridge-test
+         (search expected message :test #'char=))))))
 
 (define-bridge-test stream-anchor-distance-excess-fails-closed
   (check-bridge-test
@@ -686,19 +891,61 @@
         (check-bridge-test (= source-time 567890))))))
 
 (define-bridge-test stream-anchor-recognizes-bridge-video-mappings
-  (dolist
-      (descriptors
-       (list
-        (make-vp9-mapping-descriptors)
-        (make-av1-mapping-descriptors
-         (make-av1-codec-configuration
-          :level 8))))
-    (check-bridge-test
-     (stream-anchor-video-stream-p
-      (make-pmt-stream
-       :stream-type #x06
-       :elementary-pid +test-video-pid+
-       :descriptors descriptors)))))
+  (let ((configuration
+          (make-av1-codec-configuration :level 8)))
+    (dolist
+        (entry
+         (list
+          (list :vp9 (make-vp9-mapping-descriptors))
+          (list :av1
+                (make-av1-mapping-descriptors configuration))))
+      (destructuring-bind (codec descriptors) entry
+        (let ((stream
+                (make-pmt-stream
+                 :stream-type #x06
+                 :elementary-pid +test-video-pid+
+                 :descriptors descriptors)))
+          (check-bridge-test
+           (eq (stream-anchor-video-codec stream) codec))
+          (check-bridge-test
+           (stream-anchor-video-stream-p stream)))))))
+
+(define-bridge-test stream-anchor-rejects-ambiguous-private-video-mapping
+  (let ((configuration
+          (make-av1-codec-configuration :level 8)))
+    (let ((message
+            (handler-case
+                (progn
+                  (stream-anchor-video-codec
+                   (make-pmt-stream
+                    :stream-type #x06
+                    :elementary-pid +test-video-pid+
+                    :descriptors
+                    (append
+                     (make-vp9-mapping-descriptors)
+                     (make-av1-mapping-descriptors configuration))))
+                  nil)
+              (bridge-error (condition)
+                (bridge-error-message condition)))))
+      (check-bridge-test message)
+      (check-bridge-test
+       (search "STREAM_ANCHOR_VIDEO_CODEC_AMBIGUOUS"
+               message :test #'char=)))))
+
+(define-bridge-test stream-anchor-identifies-standard-video-codecs
+  (dolist (entry
+           '((#x01 :mpeg1)
+             (#x02 :mpeg2)
+             (#x1b :avc)
+             (#x24 :hevc)))
+    (destructuring-bind (stream-type codec) entry
+      (check-bridge-test
+       (eq
+        (stream-anchor-video-codec
+         (make-pmt-stream
+          :stream-type stream-type
+          :elementary-pid +test-video-pid+))
+        codec)))))
 
 (define-bridge-test stream-anchor-finalizes-av1-private-stream-id
   (let* ((configuration
