@@ -11,11 +11,11 @@
                          :auto-close nil))
 
 (defun %open-binary-output ()
-  "標準出力fdをoctet streamとして開く。"
+  "標準出力fdを低遅延のbuffered octet streamとして開く。"
   (sb-sys:make-fd-stream 1
                          :output t
                          :element-type 'octet
-                         :buffering :none
+                         :buffering :full
                          :auto-close nil))
 
 (defun %run-pass-through ()
