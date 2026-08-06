@@ -95,7 +95,17 @@ EOF に達した場合は fail closed にする。
 - start-code emulation を生じる payload byte 列へ `0x03` を挿入する。
 - 1 PES は 1 AV1 access unit のみを収録する。
 - PES `stream_id` は `0xBD`、`data_alignment_indicator` は 1。
+- 入力の `PES_packet_length` が 0 の場合は次の PUSI または EOF までを
+  一つの映像 PES とし、逐次変換後も 0 を保持する。非 0 の宣言長から
+  再構築した PES が 16 bit の長さ上限を超える場合も 0 とする。これは
+  MPEG-2 TS 内の video elementary stream に認められる unbounded length
+  であり、同じ `stream_id` `0xBD` を使う Opus 音声の非 0 契約とは区別する。
 - PTS は必須とし、DTS が存在する場合は保持する。
+- profile、tier、level の組を変更する間隔は、DTS を優先し、DTS が
+  なければ PTS を使う ordering time 上で 1 秒以上とする。
+- 最初の access unit または直前の random access point から次の random
+  access point までを 2 秒以下とする。ちょうど 2 秒は受理し、超過は
+  `AV1_RAP_INTERVAL_EXCEEDED` で fail closed にする。
 - key frame または delayed key frame の先頭 packet では PUSI、
   random access indicator、elementary stream priority indicator を
   設定する。
@@ -121,9 +131,11 @@ elementary stream buffer `EB_n` の size を指す編集上の誤記として扱
   period の起点として追跡し、連続非空期間を 1 秒以下に制限する。
   各 arrival、discontinuity、EOF で直前 busy period の最終空化時刻を
   検査し、TB が少なくとも毎秒 1 回空にならない場合は fail closed にする。
-- PCR の基準 byte index は `packet_index * 188 + 10` とする。CBR から
-  算出した PCR との差は 27 MHz clock で 13.5 tick 以下でなければ
-  fail closed にする。
+- PCR field は TS packet の byte 6 から 11 にあり、`PCR_base` の最終 bit
+  は byte 10 の先頭 bit に置かれる。この bit が T-STD 入力へ到着する時刻を
+  基準に、PCR の byte index は `packet_index * 188 + 10` とする。CBR から
+  算出した PCR との差は、MPEG-2 Systems の PCR accuracy である 500 ns、
+  すなわち 27 MHz clock で 13.5 tick 以下でなければ fail closed にする。
 - 最初の PCR を基準とする DTS 時刻は
   `arrival(first_pcr_byte) + (DTS * 300 - first_PCR) / 27,000,000`
   とする。
