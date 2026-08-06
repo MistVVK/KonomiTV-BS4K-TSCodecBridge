@@ -390,12 +390,12 @@
 (defun read-av1-uvlc (reader)
   "AV1のunsigned variable length codeを読む。"
   (let ((leading-zeroes 0))
-    (loop while (= (read-one-bit reader) 0)
-          do (incf leading-zeroes)
-             (when (= leading-zeroes 32)
-               (return-from read-av1-uvlc #xffffffff)))
-    (+ (- (ash 1 leading-zeroes) 1)
-       (read-bits reader leading-zeroes))))
+    (loop until (= (read-one-bit reader) 1)
+          do (incf leading-zeroes))
+    (if (>= leading-zeroes 32)
+        #xffffffff
+        (+ (- (ash 1 leading-zeroes) 1)
+           (read-bits reader leading-zeroes)))))
 
 (defun parse-av1-timing-info (reader)
   "AV1 timing_infoを読み飛ばす。"

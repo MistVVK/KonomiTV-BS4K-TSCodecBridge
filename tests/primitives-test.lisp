@@ -31,6 +31,25 @@
     (check-bridge-test (= (read-bits reader 8) #x7f))
     (check-bridge-test (= (bit-reader-remaining reader) 0))))
 
+(define-bridge-test av1-uvlc-maximum-consumes-terminator
+  (let ((bits
+          (make-array 40
+                      :element-type 'bit
+                      :adjustable t
+                      :fill-pointer 0)))
+    (loop repeat 32
+          do (vector-push-extend 0 bits))
+    (vector-push-extend 1 bits)
+    (append-integer-bits bits #b101 3)
+    (append-integer-bits bits 0 4)
+    (let ((reader
+            (make-bit-reader
+             (bit-vector-to-octets bits))))
+      (check-bridge-test
+       (= (read-av1-uvlc reader) #xffffffff))
+      (check-bridge-test (= (read-bits reader 3) #b101))
+      (check-bridge-test (= (bit-reader-remaining reader) 4)))))
+
 (define-bridge-test crc32-mpeg2-check-vector
   (let ((input
           (map '(simple-array (unsigned-byte 8) (*))
