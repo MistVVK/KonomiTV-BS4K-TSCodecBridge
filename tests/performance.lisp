@@ -319,12 +319,21 @@
             packet-function pts continuity-counter packet-index))
          (samples '())
          (cpu-samples '())
-         (streamed-before-next-pusi-p t))
+         (streamed-before-next-pusi-p t)
+         (total-packet-count 0)
+         (processing-wall-start nil)
+         (processing-cpu-start nil)
+         (processing-wall-end nil)
+         (processing-cpu-end nil))
     (dolist (packet
              (append
               (make-test-pat-packets)
               (make-test-pmt-packets :two-audio-p nil)))
       (process-bridge-packet processor packet))
+    (setf processing-wall-start
+          (performance-monotonic-nanoseconds)
+          processing-cpu-start
+          (performance-thread-cpu-nanoseconds))
     (loop for sample-index from
             (- +benchmark-warm-up-sample-count+)
               below sample-count
@@ -351,6 +360,7 @@
             (> (benchmark-output-byte-count output)
                output-length)
           (setf streamed-before-next-pusi-p nil)))
+      (incf total-packet-count (length current))
       (dolist (packet (rest current))
         (process-bridge-packet processor packet))
       (setf continuity-counter
@@ -362,6 +372,10 @@
             (funcall packet-function
                      pts continuity-counter packet-index)))
     (finish-bridge-processor processor)
+    (setf processing-wall-end
+          (performance-monotonic-nanoseconds)
+          processing-cpu-end
+          (performance-thread-cpu-nanoseconds))
     (let ((p50 (percentile-value samples 0.50d0))
           (p95 (percentile-value samples 0.95d0))
           (p99 (percentile-value samples 0.99d0))
@@ -378,6 +392,15 @@
        :auxiliary-clock :thread-cpu-clock-gettime
        :input-packet-count
        (length (funcall packet-function 0 0 0))
+       :processed-packet-count total-packet-count
+       :sustained-input-mbps
+       (/ (* total-packet-count
+             +ts-packet-size+ 8 1000.0d0)
+          (- processing-wall-end processing-wall-start))
+       :sustained-thread-cpu-mbps
+       (/ (* total-packet-count
+             +ts-packet-size+ 8 1000.0d0)
+          (- processing-cpu-end processing-cpu-start))
        :first-output-p50-ms p50
        :first-output-p95-ms p95
        :first-output-p99-ms p99

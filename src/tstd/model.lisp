@@ -296,20 +296,88 @@
         next-service-end))))
 
 (defun process-tstd-transport-packet (model arrival)
-  "映像PIDの188 byteを各t(i)でTBへ投入し、離脱時刻vectorを返す。"
+  "映像PIDの188 byteを各t(i)でTBへ投入し、離脱時刻rangeを返す。"
   (let* ((clock (tstd-model-clock model))
          (arrival-interval
            (/ 8
-              (tstd-arrival-clock-transport-rate-bps
-               clock)))
-         (departures
-           (make-array +ts-packet-size+)))
-    (dotimes (offset +ts-packet-size+ departures)
-      (setf
-       (aref departures offset)
-       (process-tstd-transport-byte
-        model
-        (+ arrival (* offset arrival-interval)))))))
+               (tstd-arrival-clock-transport-rate-bps
+                clock)))
+         (service-interval
+           (/ (tstd-model-rx-bytes-per-second model)))
+         (first-departure
+           (process-tstd-transport-byte model arrival))
+         (second-arrival (+ arrival arrival-interval)))
+    ;; 最初のbyteが次のarrivalまでに空なら、以後も各byteは独立した
+    ;; busy periodになる。全188回の有理数recurrenceを閉形式で更新する。
+    (when (<= first-departure second-arrival)
+      (validate-tstd-transport-busy-period
+       model first-departure :arrival)
+      (let* ((last-offset (1- +ts-packet-size+))
+             (last-arrival
+               (+ arrival (* last-offset arrival-interval)))
+             (last-departure (+ last-arrival service-interval))
+             (penultimate-departure
+               (+ arrival
+                  (* (- last-offset 1) arrival-interval)
+                  service-interval))
+             (second-departure
+               (+ second-arrival service-interval)))
+        (setf
+         (tstd-model-transport-buffer-fullness model) 1
+         (tstd-model-transport-buffer-last-arrival model)
+         last-arrival
+         (tstd-model-transport-buffer-service-end model)
+         last-departure
+         (tstd-model-transport-buffer-busy-start model)
+         last-arrival
+         (tstd-model-transport-buffer-last-empty model)
+         penultimate-departure)
+        (return-from process-tstd-transport-packet
+          (if (= (- second-departure first-departure)
+                 arrival-interval)
+              (vector
+               (make-tstd-departure-range
+                0 +ts-packet-size+
+                first-departure arrival-interval))
+              (vector
+               (make-tstd-departure-range
+                0 1 first-departure 0)
+               (make-tstd-departure-range
+                1 +ts-packet-size+
+                second-departure arrival-interval))))))
+    ;; TBがbyte間で空にならない条件は従来のrecurrenceを保ち、結果だけを
+    ;; 等間隔rangeへ圧縮して後段の一括処理へ渡す。
+    (let ((ranges '())
+          (range-start 0)
+          (range-first first-departure)
+          (range-interval nil)
+          (previous first-departure))
+      (loop for offset from 1 below +ts-packet-size+
+            for departure =
+              (process-tstd-transport-byte
+               model
+               (+ arrival (* offset arrival-interval)))
+            for interval = (- departure previous)
+            do
+               (cond
+                 ((null range-interval)
+                  (setf range-interval interval))
+                 ((/= interval range-interval)
+                  (push
+                   (make-tstd-departure-range
+                    range-start offset range-first
+                    range-interval)
+                   ranges)
+                  (setf range-start offset
+                        range-first departure
+                        range-interval nil)))
+               (setf previous departure))
+      (push
+       (make-tstd-departure-range
+        range-start +ts-packet-size+ range-first
+        (or range-interval 0))
+       ranges)
+      (coerce (nreverse ranges) 'simple-vector))))
 
 (defun tstd-transport-packet-overflow-p
     (model arrival rate)
@@ -611,6 +679,112 @@
        access-unit es-start es-end
        first-service-end interval)
       last-service-end)))
+
+(defun process-tstd-multiplex-header-source-range
+    (model start end first-departure source-interval)
+  "TB離脱間隔を保ってPES header範囲をMBへ投入する。"
+  (let ((service-interval
+          (/ (tstd-model-rx-bytes-per-second model))))
+    (if (= source-interval service-interval)
+        (process-tstd-multiplex-header-range
+         model start end first-departure)
+        (loop for offset from start below end
+              for departure = first-departure
+                then (+ departure source-interval)
+              do
+                 (process-tstd-multiplex-header-range
+                  model offset (+ offset 1) departure)))))
+
+(defun process-tstd-independent-multiplex-range
+    (model access-unit packet start end
+     first-departure source-interval)
+  "byte間で空になるMBへpayload範囲を閉形式で投入する。"
+  (let* ((count (- end start))
+         (rate (tstd-model-rx-bytes-per-second model))
+         (service-interval (/ rate))
+         (fullness
+           (tstd-multiplex-fullness-at
+            model first-departure))
+         (capacity
+           (tstd-model-multiplex-buffer-size model)))
+    (unless (zerop fullness)
+      (bridge-error
+       "TSTD_MB_INDEPENDENT_RANGE_NOT_EMPTY fullness=~A"
+       fullness))
+    (when (> 1 capacity)
+      (bridge-error
+       "TSTD_MB_OVERFLOW fullness=1 capacity=~A"
+       capacity))
+    (let* ((last-source-departure
+             (+ first-departure
+                (* (- count 1) source-interval)))
+           (first-service-end
+             (+ first-departure service-interval))
+           (last-service-end
+             (+ last-source-departure service-interval))
+           (es (tstd-access-unit-es access-unit))
+           (es-start (length es))
+           (es-end (+ es-start count)))
+      (setf
+       (tstd-model-multiplex-buffer-fullness model) 1
+       (tstd-model-multiplex-buffer-last-arrival model)
+       last-source-departure
+       (tstd-model-multiplex-buffer-service-end model)
+       last-service-end)
+      (unless (tstd-access-unit-mb-first-departure access-unit)
+        (setf
+         (tstd-access-unit-mb-first-departure access-unit)
+         first-service-end))
+      (setf
+       (tstd-access-unit-mb-last-departure access-unit)
+       last-service-end)
+      (loop for offset from start below end
+            do
+               (vector-push-extend
+                (aref packet offset) es))
+      (append-tstd-departure-range
+       access-unit es-start es-end
+       first-service-end source-interval)
+      last-service-end)))
+
+(defun process-tstd-multiplex-source-range
+    (model access-unit packet start end
+     first-departure source-interval)
+  "TB離脱間隔を保ってPES payload範囲をMBへ投入する。"
+  (let ((service-interval
+          (/ (tstd-model-rx-bytes-per-second model))))
+    (when (= source-interval service-interval)
+      (return-from process-tstd-multiplex-source-range
+        (process-tstd-multiplex-range
+         model access-unit packet start end first-departure)))
+    (loop with offset = start
+          with departure = first-departure
+          while (< offset end)
+          for service-end =
+            (tstd-model-multiplex-buffer-service-end model)
+          for header-removal =
+            (tstd-model-multiplex-buffer-header-removal-time model)
+          for pending-header =
+            (tstd-model-multiplex-buffer-pending-header-bytes model)
+          do
+             (when
+                 (and
+                  service-end
+                  (<= service-end departure)
+                  (>= source-interval service-interval)
+                  (or
+                   (zerop pending-header)
+                   (and header-removal
+                        (<= header-removal departure))))
+               (return
+                 (process-tstd-independent-multiplex-range
+                  model access-unit packet offset end
+                  departure source-interval)))
+             (process-tstd-multiplex-range
+              model access-unit packet offset (+ offset 1)
+              departure)
+             (incf offset)
+             (incf departure source-interval))))
 
 (defun insert-tstd-elementary-removal (model time count)
   "EB removalを時刻順queueへ追加する。"
@@ -1175,7 +1349,7 @@
         (start-next-tstd-access-unit model arrival))
       (let ((access-unit
               (tstd-model-current-access-unit model))
-            (tb-departures
+            (tb-departure-ranges
               (process-tstd-transport-packet
                model arrival)))
         (cond
@@ -1184,26 +1358,37 @@
                     (classify-tstd-video-packet-byte-ranges
                      (tstd-model-classifier model)
                      packet)))
-             (dolist (range ranges)
-               (let ((start
-                       (tstd-pes-byte-range-start range))
-                     (end
-                       (tstd-pes-byte-range-end range)))
-                 (ecase
-                     (tstd-pes-byte-range-kind range)
-                   (:header
-                    (loop for offset from start below end
-                          do
-                      (process-tstd-multiplex-header-range
-                       model offset (+ offset 1)
-                       (aref tb-departures offset))))
-                   (:payload
-                    (loop for offset from start below end
-                          do
-                      (process-tstd-multiplex-range
-                       model access-unit packet
-                       offset (+ offset 1)
-                       (aref tb-departures offset)))))))))
+              (dolist (range ranges)
+                (loop for departure-range across
+                        tb-departure-ranges
+                      for start =
+                        (max
+                         (tstd-pes-byte-range-start range)
+                         (tstd-departure-range-start
+                          departure-range))
+                      for end =
+                        (min
+                         (tstd-pes-byte-range-end range)
+                         (tstd-departure-range-end
+                          departure-range))
+                      when (< start end)
+                        do
+                  (let ((first-departure
+                          (tstd-departure-range-time
+                           departure-range start))
+                        (source-interval
+                          (tstd-departure-range-interval
+                           departure-range)))
+                    (ecase
+                        (tstd-pes-byte-range-kind range)
+                      (:header
+                       (process-tstd-multiplex-header-source-range
+                        model start end first-departure
+                        source-interval))
+                      (:payload
+                       (process-tstd-multiplex-source-range
+                        model access-unit packet start end
+                        first-departure source-interval))))))))
           ((and
             (ts-payload-offset packet)
             (not (tstd-model-discarding-access-unit-p model)))

@@ -11,6 +11,34 @@
    :tier tier
    :low-delay-mode-p low-delay-mode-p))
 
+(defun process-tstd-transport-packet-reference
+    (model arrival)
+  "単体試験用に188 byteのTB recurrenceを逐次実行する。"
+  (let* ((clock (tstd-model-clock model))
+         (arrival-interval
+           (/ 8
+              (tstd-arrival-clock-transport-rate-bps
+               clock)))
+         (departures
+           (make-array +ts-packet-size+)))
+    (dotimes (offset +ts-packet-size+ departures)
+      (setf
+       (aref departures offset)
+       (process-tstd-transport-byte
+        model
+        (+ arrival (* offset arrival-interval)))))))
+
+(defun tstd-packet-departure-at (ranges offset)
+  "圧縮済みRANGESからpacket内OFFSETのTB離脱時刻を返す。"
+  (loop for range across ranges
+        when (< offset (tstd-departure-range-end range))
+          do (return
+               (tstd-departure-range-time range offset))
+        finally
+           (bridge-error
+            "Test departure range is missing offset ~D"
+            offset)))
+
 (defun tstd-transport-packet-overflow-reference-p
     (model arrival rate)
   "実際のbyte逐次TB処理で1 packetがoverflowするか非破壊で返す。"
@@ -20,7 +48,8 @@
      rate)
     (handler-case
         (progn
-          (process-tstd-transport-packet reference arrival)
+          (process-tstd-transport-packet-reference
+           reference arrival)
           nil)
       (bridge-error (condition)
         (if (search
@@ -218,11 +247,38 @@
                 (bridge-error-message condition)))))
       (check-bridge-test
        (and
-        message
-        (search
-         "TSTD_TB_OVERFLOW fullness=178756/349 capacity=512"
-         message
-         :test #'char=))))))
+          message
+          (search
+           "TSTD_TB_OVERFLOW fullness=178756/349 capacity=512"
+           message
+           :test #'char=))))))
+
+(define-bridge-test tstd-tb-packet-ranges-match-byte-recurrence
+  (dolist (rate '(100000 188000 376000))
+    (let* ((optimized (make-tstd-model 1504))
+           (reference (make-tstd-model 1504))
+           (clock (tstd-model-clock optimized)))
+      (setf
+       (tstd-model-rx-bytes-per-second optimized) rate
+       (tstd-model-rx-bytes-per-second reference) rate)
+      (dolist (packet-index '(0 1 3))
+        (let* ((arrival
+                 (tstd-packet-arrival-time
+                  clock packet-index))
+               (ranges
+                 (process-tstd-transport-packet
+                  optimized arrival))
+               (departures
+                 (process-tstd-transport-packet-reference
+                  reference arrival)))
+          (dotimes (offset +ts-packet-size+)
+            (check-bridge-test
+             (= (tstd-packet-departure-at ranges offset)
+                (aref departures offset))))
+          (check-bridge-test
+           (equal
+            (tstd-transport-predictor-state optimized)
+            (tstd-transport-predictor-state reference))))))))
 
 (define-bridge-test tstd-tb-fast-drain-waits-for-each-byte
   (let ((model (make-tstd-model 1504)))
@@ -233,9 +289,11 @@
     (let ((departures
             (process-tstd-transport-packet model 0)))
       (check-bridge-test
-       (= (aref departures 0) 1/376000))
+       (= (tstd-packet-departure-at departures 0)
+          1/376000))
       (check-bridge-test
-       (= (aref departures 187) 375/376000))
+       (= (tstd-packet-departure-at departures 187)
+          375/376000))
       (check-bridge-test
        (= (tstd-model-transport-buffer-fullness model) 1)))
     (finish-tstd-transport-busy-period model :eof)
