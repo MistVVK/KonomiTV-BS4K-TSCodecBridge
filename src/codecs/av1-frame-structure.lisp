@@ -604,7 +604,7 @@
         (let ((level
                 (av1-structure-read-bits
                  reader 5 :sequence-level)))
-          (when (> level 31)
+          (when (and (> level 23) (/= level 31))
             (bridge-error
              "AV1_SEQUENCE_LEVEL_RESERVED level=~D" level))
           (setf operating-points
@@ -654,6 +654,9 @@
                        (av1-structure-read-bits
                         reader 5 :sequence-level))
                      (decoder-model-p nil))
+                (when (and (> level 23) (/= level 31))
+                  (bridge-error
+                   "AV1_SEQUENCE_LEVEL_RESERVED level=~D" level))
                 ;; 0 means all layers.  0x101 is the explicit base-only
                 ;; operating point.  Any other mask declares a layer set this
                 ;; validator intentionally does not implement.

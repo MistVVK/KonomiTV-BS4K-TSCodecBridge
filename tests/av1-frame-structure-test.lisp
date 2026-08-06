@@ -372,6 +372,39 @@
          (av1-frame-validation-state-reference-slots next-state)
          0))))))
 
+(define-bridge-test av1-frame-structure-rejects-reserved-sequence-levels
+  (labels ((parse-sequence (access-unit)
+             (parse-av1-sequence-header-validation-state
+              access-unit
+              (first (parse-av1-obus access-unit))))
+           (make-reduced-prefix (level)
+             (let ((writer (make-av1-structure-test-writer)))
+               (av1-structure-test-write writer 0 3)
+               (av1-structure-test-flag writer t)
+               (av1-structure-test-flag writer t)
+               (av1-structure-test-write writer level 5)
+               (av1-structure-test-align writer)
+               (make-av1-structure-test-obu
+                1 (av1-structure-test-octets writer)))))
+    (dolist (level '(24 25 26 27 28 29 30))
+      (dolist (access-unit
+               (list
+                (make-av1-structure-test-sequence :level level)
+                (make-reduced-prefix level)))
+        (let ((message
+                (handler-case
+                    (progn (parse-sequence access-unit) nil)
+                  (bridge-error (condition)
+                    (bridge-error-message condition)))))
+          (check-bridge-test
+           (and message
+                (search "AV1_SEQUENCE_LEVEL_RESERVED" message))))))
+    (check-bridge-test
+     (typep
+      (parse-sequence
+       (make-av1-structure-test-sequence :level 31))
+      'av1-sequence-validation-state))))
+
 (define-bridge-test av1-frame-structure-two-tile-coverage
   (multiple-value-bind (result state sequence)
       (av1-structure-test-parse-key :width 128 :two-tiles t)
