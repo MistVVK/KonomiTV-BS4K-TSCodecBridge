@@ -139,10 +139,17 @@ elementary stream buffer `EB_n` の size を指す編集上の誤記として扱
 - multiplex buffer size は bit 単位で
   `(1/750 + 0.004) * max(1100 * BitRate, 2,000,000)
   + 0.1 * BufferSize` とし、最後に 8 で割る。
-- 通常 mode の decoder removal は DTS、`low_delay_mode_flag = 1`
-  では `max(DTS, MB 最終 departure + 1 / 27,000,000 秒)` とする。
-  access unit の最初の arrival から removal までの上限は 10 秒とする。
-  同時刻では removal を arrival より先に適用する。
+- FFmpeg/libaom の realtime 出力では、実際には low-delay 動作でも
+  `low_delay_mode_flag` が 0 のことがある。この入力を誤拒否しないため、
+  Bridge の受理判定では flag の値にかかわらず decoder removal を
+  `max(DTS, MB 最終 departure + 1 / 27,000,000 秒)` とする。
+  bitstream の flag 自体は書き換えない。この挙動は draft の strict mode
+  における EB underflow 禁止を意図的に緩和するものであり、厳格な T-STD
+  適合性の判定ではなく、本プロジェクトの realtime 入力 subset の契約とする。
+  access unit の最初の arrival から実効 removal までの上限は 10 秒とする。
+  DTS または PTS が live mux の時刻ゆらぎにより実効 removal より前になる
+  場合は 3 秒以内だけ arrival または removal へ clamp し、それを超えれば
+  fail closed にする。同時刻では removal を arrival より先に適用する。
 - Buffer Pool は AV1 Annex E の `BUFFER_POOL_MAX_SIZE = 10` とし、
   decoded access unit を Scheduled Removal Timing で瞬時に投入する。
   8 個の VBI、decoder reference count、player reference count、
