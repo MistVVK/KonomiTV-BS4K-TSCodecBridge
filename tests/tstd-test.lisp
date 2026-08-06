@@ -1955,6 +1955,7 @@
      (pes-assembler-active-p assembler) t
      (pes-assembler-streaming-p assembler) t
      (pes-assembler-entries assembler) (list source-entry)
+     (pes-assembler-first-entry-slot-index assembler) 4
      (pes-assembler-av1-stream-last-template assembler)
      template)
     ;; 前PESのtemplateが残っていても、現PESのPUSIより前のnullに
@@ -1975,6 +1976,45 @@
       (check-bridge-test (equalp (first packets) null-packet))
       (check-bridge-test
        (= (pes-assembler-av1-stream-byte-count assembler) 1)))))
+
+(define-bridge-test av1-null-current-pes-boundary-uses-recorded-slot
+  (let ((processor
+           (make-bridge-processor
+            (make-instance 'octet-collector-stream)
+            :passthrough :opus))
+         (assembler
+           (%make-pes-assembler +test-video-pid+ :video))
+         (first-entry
+           (make-pending-entry
+            :packet
+            (make-ts-packet
+             +test-video-pid+ 0
+             (octets 0 0 1 #xe0 0 100)
+             :payload-unit-start t)
+            :slot-index 40)))
+    (process-target-pes-packet
+     processor assembler first-entry
+     (pending-entry-packet first-entry))
+    (check-bridge-test
+     (= (pes-assembler-first-entry-slot-index assembler) 40))
+    ;; 境界判定が成長するentry listを末尾走査しないことを直接検証する。
+    (setf (pes-assembler-entries assembler) '())
+    (check-bridge-test
+     (not
+      (av1-null-inside-current-pes-p
+       assembler
+       (make-pending-entry :slot-index 39))))
+    (check-bridge-test
+     (av1-null-inside-current-pes-p
+      assembler
+      (make-pending-entry :slot-index 40)))
+    (check-bridge-test
+     (av1-null-inside-current-pes-p
+      assembler
+      (make-pending-entry :slot-index 40000)))
+    (clear-pes-event-state assembler)
+    (check-bridge-test
+     (null (pes-assembler-first-entry-slot-index assembler)))))
 
 (define-bridge-test fixed-packet-allocator-rejects-eof-backlog
   (let ((processor

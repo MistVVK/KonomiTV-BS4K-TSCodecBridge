@@ -106,6 +106,7 @@
   (kind :video :type (member :video :opus) :read-only t)
   (active-p nil :type boolean)
   (entries '() :type list)
+  (first-entry-slot-index nil :type (or null (integer 0 *)))
   (buffer
     (make-array 0
                 :element-type 'octet
@@ -1954,11 +1955,11 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
 
 (defun av1-null-inside-current-pes-p (assembler entry)
   "ENTRYのnullが現在AV1 PESのPUSI以降のslotにあるか返す。"
-  (let ((first-entry
-          (car (last (pes-assembler-entries assembler)))))
+  (let ((first-slot
+          (pes-assembler-first-entry-slot-index assembler)))
     (and
-     first-entry
-     (<= (pending-entry-slot-index first-entry)
+     first-slot
+     (<= first-slot
          (pending-entry-slot-index entry)))))
 
 (defun allocate-output-entry (processor entry)
@@ -2545,6 +2546,7 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
   "ASSEMBLERの完了済みPES eventとAV1残留を初期化する。"
   (setf (pes-assembler-active-p assembler) nil
         (pes-assembler-entries assembler) '()
+        (pes-assembler-first-entry-slot-index assembler) nil
         (fill-pointer (pes-assembler-buffer assembler)) 0
         (pes-assembler-expected-length assembler) nil
         (pes-assembler-streaming-p assembler) nil
@@ -2587,6 +2589,7 @@ CONSUME-CURRENT-SLOT-Pなら現在slotの先頭でextraを消費できるため�
           t
           (pes-assembler-pending-pts-discontinuity-p assembler) nil))
   (setf (pes-assembler-active-p assembler) t
+        (pes-assembler-first-entry-slot-index assembler) nil
         (pes-assembler-source-pmt-table assembler)
         (and (bridge-processor-latest-pmt-table processor)
              (copy-program-map-table-deep
@@ -3893,6 +3896,9 @@ video/null targetへ移す。選択PCRを含むadaptation fieldは元slotに残�
            (return-from process-target-pes-packet nil))))
     (unless output-target-consumed-p
       (mark-entry-unresolved entry))
+    (unless (pes-assembler-first-entry-slot-index assembler)
+      (setf (pes-assembler-first-entry-slot-index assembler)
+            (pending-entry-slot-index entry)))
     (push entry (pes-assembler-entries assembler))
     (when (ts-has-payload-p packet)
       (append-pes-octets assembler packet)
